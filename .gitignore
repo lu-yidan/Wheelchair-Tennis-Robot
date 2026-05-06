@@ -1,1 +1,29 @@
 .DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+
+# ML model weights
+*.pt
+*.onnx
+*.engine
+
+# Video recordings
+*.mp4
+*.avi
+*.mkv
+
+# ROS build artifacts
+build/
+devel/
+.catkin_workspace
+
+# Claude Code internal
+memory/
+
+# Editor
+.vscode/
+*.swp
