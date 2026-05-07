@@ -1,45 +1,54 @@
 # ball_detection
 
-Real-time tennis ball detection and 3D position output for the wheelchair tennis robot.
+Real-time tennis ball detection, 3-D localisation, and trajectory prediction for the wheelchair tennis robot.
 
 Two implementations coexist — choose based on available hardware:
 
-| | ZED (production) | D455 (standalone testing) |
+| | ZED (production) | D455 (standalone) |
 |---|---|---|
-| Hardware | ZED 2 stereo camera + Jetson Nano | Intel RealSense D455 |
-| Language | C++ (CUDA) | Python |
-| Entry point | `src/ball_detection.cpp` | `ball_detection_d455.py` |
-| ROS output | `/ball_detection` topic | terminal + OpenCV window |
-| Dependencies | ZED SDK, OpenCV 4.5.2+, CUDA | pyrealsense2, opencv-python |
+| **Hardware** | ZED 2 stereo camera + Jetson Nano | Intel RealSense D455 |
+| **Language** | C++ (CUDA) | Python |
+| **Entry point** | `src/ball_detection.cpp` | `ball_detection_d455.py` |
+| **Output** | `/ball_detection` ROS topic | terminal + OpenCV window |
+| **Dependencies** | ZED SDK, OpenCV 4.5.2+, CUDA | pyrealsense2, opencv-python |
 
 ---
 
 ## ZED / Production
 
-Built as part of the catkin workspace. Requires ZED SDK and CUDA.
+Built inside the catkin workspace. Requires ZED SDK and CUDA.
 
 ```bash
 catkin_make --pkg ball_detection
 roslaunch ball_detection ball_detection.launch
 ```
 
-Config: `config/settings.yaml` (HSV range, covariance polynomials, MOG2 params)
+Config: `config/settings.yaml` (HSV ranges, MOG2 params, measurement covariance polynomials)
 
-See [ball_calibration](../ball_calibration/README.md) for extrinsic calibration setup.
+See [ball_calibration](../ball_calibration/README.md) for AprilTag-based extrinsic calibration.
 
 ---
 
 ## D455 / Standalone
 
-Standalone Python script — no ROS, no ZED SDK required. Uses `catchball` conda env.
+Standalone Python script — no ROS, no ZED SDK required.
+
+### Files
+
+| File | Purpose |
+|---|---|
+| `ball_detection_d455.py` | Main script — camera, detection, EKF, visualisation |
+| `tune_hsv_web.py` | Interactive web-based HSV / MOG2 tuner (browser UI) |
+| `generate_apriltag.py` | Print an A4 AprilTag PDF for ground-plane calibration |
+| `config/d455.yaml` | All runtime parameters; CLI flags override these |
 
 ### Environment
 
 ```bash
-conda activate catchball   # pyrealsense2 2.57+, opencv, numpy, scipy, ultralytics
+conda activate catchball   # pyrealsense2 2.57+, opencv-contrib-python, numpy, scipy, ultralytics
 ```
 
-First-time Linux udev setup (one-off):
+First-time Linux udev setup (one-off, gives non-root USB access):
 
 ```bash
 wget https://raw.githubusercontent.com/IntelRealSense/librealsense/master/config/99-realsense-libusb.rules
@@ -47,97 +56,324 @@ sudo cp 99-realsense-libusb.rules /etc/udev/rules.d/
 sudo udevadm control --reload-rules && sudo udevadm trigger
 ```
 
-### Running
+### Quick start
 
 ```bash
 cd software/ball_detection
 
-python ball_detection_d455.py                           # 1280×720, HSV+MOG2
-python ball_detection_d455.py --width 848 --height 480  # lower res, higher fps
-python ball_detection_d455.py --no-viz                  # headless / terminal only
-python ball_detection_d455.py --show-mask               # overlay HSV+motion mask
-python ball_detection_d455.py --no-motion               # disable MOG2, pure HSV
-python ball_detection_d455.py --detector yolo           # YOLO backend
-python ball_detection_d455.py --detector both           # side-by-side comparison
-python ball_detection_d455.py --record output.mp4       # record annotated video
-```
+# Default: read all settings from config/d455.yaml
+python ball_detection_d455.py
 
-HSV parameter override (from `config/settings.yaml` defaults):
+# Lower resolution, higher fps
+python ball_detection_d455.py --width 848 --height 480
 
-```bash
-python ball_detection_d455.py --h-low 10 --h-high 35 --s-min 170 --v-min 170
-# fluorescent yellow-green (outdoor / cool light):
+# Force specific detector
+python ball_detection_d455.py --detector yolo
+python ball_detection_d455.py --detector both    # side-by-side comparison
+
+# Headless / recording
+python ball_detection_d455.py --no-viz
+python ball_detection_d455.py --record output.mp4
+
+# Override HSV range on command line (CLI always wins over yaml)
 python ball_detection_d455.py --h-low 25 --h-high 80 --s-min 80 --v-min 80
 ```
 
-Ground plane — enable world-frame EKF so Z=0 = court surface:
+---
 
-```bash
-# Measure camera centre height above ground (e.g. 1.2 m) and mount pitch angle
-python ball_detection_d455.py --camera-height 1.2 --camera-pitch -15
+## Configuration — `config/d455.yaml`
 
-# Without these args the EKF runs in camera body frame and bounce is never triggered
+All parameters are documented in the file itself. CLI flags override yaml values at runtime.
+
+### Resolution / frame rate
+```yaml
+width:  1280    # 848 × 480 can run at 60 fps
+height: 720
 ```
 
-Position readout changes from `body` (camera-relative) to `agl` (above ground level).
-Bounce points appear as **cyan dots** on the predicted trajectory once the ground is known.
+### Ground plane (cold-start values)
+```yaml
+camera_height: 0.5    # metres from camera centre to floor; 0 = world frame off
+camera_pitch:  -10.0  # degrees; negative = looking down toward court
+```
+These are used on startup. Once an AprilTag is detected they are continuously
+updated via EMA and no longer need to be accurate.
 
-Physics tuning:
-
-```bash
-python ball_detection_d455.py --coeff-drag 0.55   # standard tennis ball Cd ≈ 0.47–0.65
-python ball_detection_d455.py --rest-z 0.70        # vertical restitution after bounce
+### AprilTag ground calibration
+```yaml
+tag_family: tag36h11   # must match the printed tag
+tag_id:     1          # must match the printed tag
+tag_size_m: 0.15       # outer black-square edge in metres; 0 = disable
 ```
 
-### Tuning the HSV mask interactively
-
-```bash
-python tune_hsv.py                          # 1280×720
-python tune_hsv.py --width 848 --height 480
+### Detection backend
+```yaml
+detector: hsv    # hsv | yolo | both
 ```
 
-Four windows open simultaneously:
+### HSV colour range
+```yaml
+h_low:  25    # OpenCV hue 0–179
+h_high: 80
+s_min:  100   # saturation 0–255
+v_min:  100   # value (brightness) 0–255
+```
+Use `tune_hsv_web.py` to find the right values interactively.
 
-| Window | Content |
+### MOG2 motion filter
+```yaml
+motion: false   # true = HSV ∩ MOG2 (reduces static false positives)
+                # false = pure HSV (better for moving camera / complex background)
+```
+
+### YOLO (when detector: yolo or both)
+```yaml
+yolo_model: models/yolov8n.pt
+yolo_imgsz: 480
+yolo_conf:  0.3
+```
+
+### Physics
+```yaml
+coeff_drag: 0.47   # tennis ball C_d  ≈ 0.47–0.65
+rest_x: 0.75       # horizontal restitution after bounce
+rest_y: 0.75
+rest_z: 0.75       # vertical restitution
+```
+
+### Visualisation / recording
+```yaml
+viz:       true     # show OpenCV window
+show_mask: false    # show HSV+MOG2 mask panel
+traj:      true     # show predicted trajectory arc
+record:    false    # false | true (auto-name) | "filename.mp4"
+```
+
+---
+
+## Pipeline internals
+
+### 1 · Coordinate frames
+
+```
+RealSense colour sensor
+    optical frame  (OpenCV standard)
+        X → right
+        Y ↓ down
+        Z → forward (depth axis)
+        │
+        │  optical_to_body()
+        ▼
+    body frame  (camera-body, used by EKF)
+        X → forward
+        Y → left
+        Z ↑ up    gravity = −Z
+        │
+        │  body_to_world()  (only when ground plane is known)
+        ▼
+    world frame  (court surface)
+        Z = 0 = ground
+        Z ↑ up    bounce triggers when EKF state Z crosses 0
+```
+
+**`optical_to_body`**: `[X, Y, Z]_body = [Z_opt, −X_opt, −Y_opt]`
+
+**`body_to_world`** (pitch rotation around Y axis + height offset):
+```
+X_world =  cos(pitch)·X_body + sin(pitch)·Z_body
+Y_world =  Y_body
+Z_world = −sin(pitch)·X_body + cos(pitch)·Z_body + height
+```
+
+`body_to_world` / `world_to_body` are inverses.
+`pitch` is negative when camera looks down (e.g. −10° for a mounted camera).
+
+---
+
+### 2 · Ground plane detection (AprilTag)
+
+A tag36h11 AprilTag is laminated and taped to the court surface.
+The tag's own coordinate frame has Z pointing up — identical to the world frame.
+
+**Per-frame loop** (inside `detection_worker`):
+
+```
+colour frame
+    │  cv2.aruco.detectMarkers / ArucoDetector
+    ▼
+detected corners (4 × 2 pixels)
+    │  cv2.solvePnP(tag_obj_pts, img_pts, cam_matrix, dist, IPPE_SQUARE)
+    ▼
+rvec, tvec  — pose of tag in optical frame
+    │
+    ├─ camera origin in tag/world frame:  t_cam = −R.T @ tvec
+    │      camera_height = t_cam[2]
+    │
+    └─ camera look direction in world:    look = R.T @ [0,0,1]
+           camera_pitch  = arcsin(look[2])
+    │
+    │  EMA smoothing  (α = 0.3 per frame)
+    ▼
+_pose["height"]    updated
+_pose["pitch_rad"] updated
+_pose["age"]  = 0
+```
+
+**Age indicator** shown on the detection panel:
+
+| Colour | Meaning |
 |---|---|
-| **1 Color+detect** | Raw frame — grey = candidates, green = best detection |
-| **2 HSV mask** | Yellow tint = pixels passing HSV filter |
-| **3 MOG2 motion** | Blue tint = moving pixels |
-| **4 Combined** | Green tint = HSV ∩ MOG2 (what drives contour search) |
+| Green `TAG OK` | Detected this frame — values are fresh |
+| Orange `TAG [Nf]` | Last seen N frames ago — using smoothed cache |
+| Red `NO TAG` | Not seen for >30 frames — using yaml cold-start values |
 
-Trackbars (on window 1): `H_low`, `H_high`, `S_min`, `V_min`, `MOG2_thr`, `Min_r_px`, `Circ100`
+If the robot moves and the tag leaves the frame, the last smoothed height and pitch are
+held (robot is on a flat court so they remain accurate for many frames).
 
-Keys: `s` — print tuned params (copy-paste ready for CLI and `settings.yaml`), `r` — reset MOG2 background model, `q` / ESC — quit.
+---
 
-### Architecture (D455 pipeline)
+### 3 · Ball detection
+
+**HSV backend** (default, fast):
 
 ```
-D455 (30/60 fps)
-  ├── Color frame ──→ MOG2 motion mask ──→ HSV + circularity ──→ (cx, cy, r_px)
-  └── Depth frame ──→ 3-step Color→Depth mapping ──→ median patch ──→ depth_sensor
-                                                            ↓
-                            visual depth (fx·R/r_px) ──→ fusion ──→ depth_fused
-                                                            ↓
-                                            rs2_deproject → optical frame
-                                                            ↓
-                                            optical_to_body → body frame (X-fwd, Z-up)
-                                                            ↓
-                                            PhysicsEKF.update()  ← measurement covariance
-                                                            ↓
-                                            PhysicsEKF.rollout() → 1 s ahead trajectory
-                                                            ↓
-                                            visualization (trail + predicted arc + bounce)
+colour frame  →  MOG2 background subtractor (optional, 0.4× scale)
+                 │
+                 └─ motion mask (dilated)
+
+colour frame  →  cv2.inRange(HSV)  →  morphological close + open
+                 │
+                 └─ HSV mask
+
+HSV mask ∩ motion mask  (or HSV mask alone when motion: false)
+    │  findContours
+    ▼
+for each contour:
+    circularity = 4π·area / perimeter²   (1.0 = perfect circle)
+    minEnclosingCircle  →  (cx, cy, r_px)
+    keep if  r_px ≥ min_r  and  circularity ≥ threshold
+best = highest  area × circularity  score
 ```
 
-**Coordinate frame**: camera body (X-forward, Y-left, Z-up). Gravity → −Z.
+**YOLO backend**: YOLOv8n tracking on a downscaled frame, class 32 (sports ball).
 
-**Physics constants** (ported from `ball_localization/src/ball_ekf.cpp`):
+**`detector: both`** runs both in parallel; each has its own EKF state.
 
-| Parameter | Value | Notes |
+---
+
+### 4 · Depth fusion
+
+For each detected ball centre `(cx, cy)`:
+
+```
+Visual depth (geometry):
+    depth_vis = fx × BALL_RADIUS / r_px
+    reliable when ball is round and well-lit
+
+Sensor depth (D455 depth frame):
+    3-step colour→depth pixel mapping (compensates stereo baseline)
+    median of 5×5 patch around projected centre
+    depth_sensor = raw_depth × depth_scale + BALL_RADIUS
+
+Fusion:
+    if both valid and ratio 0.5–2.0:  weighted average (50/50)
+    else:                             prefer visual depth
+```
+
+---
+
+### 5 · Physics EKF
+
+**State**: `x = [px, py, pz, vx, vy, vz]` in either body frame or world frame.
+
+**Process model** (ported from `ball_localization/src/ball_ekf.cpp`):
+
+```
+v² = vx² + vy² + vz²
+a_drag = C_d · ½ρ · πR² · v² / m      (quadratic drag)
+
+ax = −sign(vx) · a_drag · |vx| / |v|
+ay = −sign(vy) · a_drag · |vy| / |v|
+az =  g  − sign(vz) · a_drag · |vz| / |v|   (g = −9.795 m/s²)
+```
+
+**Measurement**: 3-D ball position from depth fusion.
+Measurement noise covariance is a polynomial in depth: `cov(d) = k2·d² + k1·d + k0`.
+A 5σ Mahalanobis gate rejects outliers.
+
+**Physics constants**:
+
+| Parameter | Value | Source |
 |---|---|---|
 | Gravity | −9.79528 m/s² | Atlanta; adjust for venue |
 | Air density | 1.225 kg/m³ | |
 | Ball mass | 0.0575 kg | ITF standard |
 | Ball radius | 0.0335 m | ITF standard |
-| C_d | 0.47 | sphere; tunable via `--coeff-drag` |
-| Restitution | 0.75 (x, y, z) | tunable via `--rest-*` |
+| C_d | 0.47 | sphere (tunable) |
+| Restitution | 0.75 × / 0.75 × / 0.75 z | tunable |
+
+---
+
+### 6 · Trajectory prediction and bounce
+
+`PhysicsEKF.rollout()` Euler-integrates the physics model 1 second forward at 10 ms steps.
+
+**Bounce detection** (per step, from `ball_ekf.cpp` lines 329–347):
+
+```
+if Z before step > 0 and Z after step < 0:
+    quadratic solve for exact floor-hit time t_f within the step
+    propagate state to t_f
+    apply restitution:
+        vx *= rest_x
+        vy *= rest_y
+        vz  = rest_z × |vz|   (reverse and attenuate)
+    continue remaining step after bounce
+```
+
+This only fires when the EKF runs in **world frame** (`_pose["height"] > 0`).
+In body frame the EKF clamps Z ≥ 0 but has no physical bounce model.
+
+Trajectory visualisation:
+- **Red dots / line**: predicted path
+- **Cyan dots**: predicted bounce points (Z crosses 0)
+
+---
+
+## Tools
+
+### `tune_hsv_web.py` — Interactive HSV tuner
+
+```bash
+python tune_hsv_web.py                          # 1280×720
+python tune_hsv_web.py --width 848 --height 480
+# open http://localhost:5000 in any browser
+```
+
+Streams a 2×2 MJPEG composite to the browser — no Qt / system fonts required.
+
+| Panel | Content |
+|---|---|
+| top-left | Raw colour frame + detected circle, FPS, ball XYZ |
+| top-right | HSV mask (cyan tint) |
+| bottom-left | MOG2 motion mask (orange), red border when disabled |
+| bottom-right | Combined mask (green tint) used for contour detection |
+
+Sliders (in browser): `H low/high`, `S min`, `V min`, `MOG2 threshold`, `Min radius`, `Circularity`.
+MOG2 toggle switch: compare HSV-only vs HSV∩MOG2 live.
+"Copy YAML" button: copies tuned values ready to paste into `config/d455.yaml`.
+
+---
+
+### `generate_apriltag.py` — Print AprilTag for ground calibration
+
+```bash
+# Print tag36h11 id=1, 150 mm black square, on A4 paper
+python generate_apriltag.py --family tag36h11 --tag-id 1 --tag-size-mm 150
+
+# Output: apriltag_tag36h11_id1_150mm_a4.pdf
+# Print at 100% scale (no "fit to page"), laminate, tape to court floor
+```
+
+The tag's **outer black-square edge** is the measurement used for `tag_size_m`.
+After printing, measure with a ruler and update `config/d455.yaml` if needed.
