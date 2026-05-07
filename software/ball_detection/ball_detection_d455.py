@@ -87,6 +87,17 @@ DT_ROLLOUT       = 0.01   # Euler integration step (s)
 
 COAST_FRAMES = 10   # hold last detection this many frames after miss
 
+# ── AprilTag ground calibration ───────────────────────────────────────────────
+TAG_EMA          = 0.3    # EMA weight applied to each new tag measurement (per frame)
+TAG_STALE_FRAMES = 30     # frames without tag before showing RED indicator
+
+_ARUCO_FAMILIES = {
+    "tag16h5":  cv2.aruco.DICT_APRILTAG_16h5,
+    "tag25h9":  cv2.aruco.DICT_APRILTAG_25h9,
+    "tag36h10": cv2.aruco.DICT_APRILTAG_36h10,
+    "tag36h11": cv2.aruco.DICT_APRILTAG_36h11,
+}
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  Coordinate transforms (inline — no external transform package needed)
@@ -487,6 +498,11 @@ def _load_config(path):
     _get("rest_y",     float, "rest_y")
     _get("rest_z",     float, "rest_z")
 
+    # AprilTag ground calibration
+    _get("tag_family",  str,   "tag_family")
+    _get("tag_id",      int,   "tag_id")
+    _get("tag_size_m",  float, "tag_size_m")
+
     # Visualisation — YAML positive, argparse negated
     if "viz" in cfg:
         out["no_viz"] = not bool(cfg["viz"])
@@ -548,9 +564,18 @@ def main():
     parser.add_argument("--record",       metavar="FILE", nargs="?", const="",
                         help="record annotated video; omit FILE for auto timestamp name")
     parser.add_argument("--camera-height", type=float, default=0.0,
-                        help="camera centre height above ground (m); enables world-frame EKF")
+                        help="camera centre height above ground (m); cold-start value when tag not yet visible")
     parser.add_argument("--camera-pitch",  type=float, default=0.0,
-                        help="camera pitch in degrees; negative = looking down (e.g. -15)")
+                        help="camera pitch in degrees; negative = looking down (cold-start value)")
+    parser.add_argument("--tag-family",   default="tag36h11",
+                        help="ArUco/AprilTag family  (tag36h11 | tag25h9 | tag16h5)")
+    parser.add_argument("--tag-id",       type=int, default=0,
+                        help="AprilTag ID to detect for ground calibration")
+    parser.add_argument("--tag-size-m",   type=float, default=0.0,
+                        help="Physical tag size — black-square outer edge in metres; "
+                             "0 = disable tag-based calibration")
+    parser.add_argument("--no-tag",       action="store_true",
+                        help="disable per-frame AprilTag ground calibration")
     parser.set_defaults(**_cfg)   # config file values override code defaults
     args = parser.parse_args()    # CLI args override everything
 
@@ -558,13 +583,25 @@ def main():
     hsv_low  = np.array([args.h_low,  args.s_min, args.v_min], dtype=np.uint8)
 
     # ── World-frame transform ─────────────────────────────────────────────────
-    # When camera-height is given, the EKF runs in world frame (Z=0 = ground)
-    # so bounce prediction and the Z display are physically meaningful.
-    # Without it, the EKF runs in camera body frame (old behaviour, no bounce).
+    # _pose is the single source of truth for camera→ground geometry.
+    # It starts with yaml cold-start values and is updated every frame by
+    # per-frame AprilTag detection (EMA-smoothed).  All closures read it via
+    # the dict reference — no nonlocal needed.
     cam_height    = args.camera_height
     cam_pitch_rad = np.radians(args.camera_pitch)
-    use_world     = cam_height > 0.01   # treat <1 cm as "not set"
-    hsv_high = np.array([args.h_high, 255,        255       ], dtype=np.uint8)
+    tag_size_m    = 0.0 if args.no_tag else args.tag_size_m
+    use_world     = cam_height > 0.01 or tag_size_m > 0.01
+
+    _pose = {
+        "height":    cam_height,     # metres above ground; updated by tag each frame
+        "pitch_rad": cam_pitch_rad,  # radians, negative = looking down; updated by tag
+        "age":       9999,           # frames since last successful tag detection
+        "corners":   None,           # last detected tag corners (int32 Nx2) for overlay
+        "rvec":      None,           # last tag rvec from solvePnP (for drawFrameAxes)
+        "tvec":      None,           # last tag tvec
+    }
+
+    hsv_high = np.array([args.h_high, 255, 255], dtype=np.uint8)
 
     rec_path = None
     if args.record is not None:
@@ -580,11 +617,16 @@ def main():
     print(f"[INFO] Physics: drag={args.coeff_drag:.3f}  "
           f"rest=({args.rest_x:.2f}, {args.rest_y:.2f}, {args.rest_z:.2f})")
     if use_world:
-        print(f"[INFO] World frame ON: camera height={cam_height:.2f} m  "
-              f"pitch={args.camera_pitch:.1f}°  → Z=0 = ground, bounce prediction active")
+        print(f"[INFO] World frame ON  cold-start: height={cam_height:.2f}m  "
+              f"pitch={args.camera_pitch:.1f}°  → Z=0=ground, bounce prediction active")
+        if tag_size_m > 0.01:
+            print(f"[INFO] AprilTag calibration: family={args.tag_family}  "
+                  f"id={args.tag_id}  size={tag_size_m:.3f}m  (updates height+pitch per frame)")
+        else:
+            print("[INFO] AprilTag calibration: disabled (--tag-size-m not set)")
     else:
-        print("[INFO] World frame OFF (--camera-height not set) → "
-              "EKF in camera body frame, bounce prediction disabled")
+        print("[INFO] World frame OFF → EKF in camera body frame, bounce prediction disabled")
+        print("[INFO]   Set --camera-height or --tag-size-m to enable world frame")
 
     # ── RealSense pipeline ────────────────────────────────────────────────────
     pipeline   = rs.pipeline()
@@ -742,6 +784,37 @@ def main():
             for label, _ in _detectors
         }
 
+        # ── ArUco / AprilTag ground calibration ───────────────────────────────
+        _tag_active = tag_size_m > 0.01
+        if _tag_active:
+            _aruco_dict   = cv2.aruco.getPredefinedDictionary(
+                _ARUCO_FAMILIES.get(args.tag_family, cv2.aruco.DICT_APRILTAG_36h11))
+            _aruco_params = cv2.aruco.DetectorParameters()
+            try:                                    # OpenCV 4.7+ OOP API
+                _aruco_obj = cv2.aruco.ArucoDetector(_aruco_dict, _aruco_params)
+                def _detect_markers(img):
+                    return _aruco_obj.detectMarkers(img)
+            except AttributeError:                  # OpenCV ≤ 4.6 legacy API
+                def _detect_markers(img):
+                    return cv2.aruco.detectMarkers(img, _aruco_dict,
+                                                   parameters=_aruco_params)
+            # 3-D tag corners in tag frame (Z=0=ground, Z-up)
+            _half = tag_size_m / 2.0
+            _tag_obj = np.array([
+                [-_half,  _half, 0.0],
+                [ _half,  _half, 0.0],
+                [ _half, -_half, 0.0],
+                [-_half, -_half, 0.0],
+            ], dtype=np.float32)
+            _cam_mat  = np.array([
+                [color_intrin.fx, 0,               color_intrin.ppx],
+                [0,               color_intrin.fy,  color_intrin.ppy],
+                [0,               0,                1               ],
+            ], dtype=np.float32)
+            _dist     = np.array(color_intrin.coeffs[:5], dtype=np.float32)
+            print(f"[INFO] ArUco detector ready: {args.tag_family} id={args.tag_id} "
+                  f"size={tag_size_m:.3f}m")
+
         video_writer = [None]
 
         # ── Depth + EKF closure  (identical pipeline for every detector) ──────
@@ -803,8 +876,9 @@ def main():
                 p_opt  = rs.rs2_deproject_pixel_to_point(
                     color_intrin, [st["cx"], st["cy"]], depth_fused)
                 p_body = optical_to_body(p_opt)
-                # Convert to world frame (Z=0=ground) if camera geometry is known
-                p_ekf  = body_to_world(p_body, cam_height, cam_pitch_rad) if use_world else p_body
+                # Convert to world frame (Z=0=ground) using current tag-derived pose
+                _h, _pr = _pose["height"], _pose["pitch_rad"]
+                p_ekf  = body_to_world(p_body, _h, _pr) if _h > 0.01 else p_body
                 st["ekf"].update(p_ekf, _meas_covariance(depth_fused), t_now)
 
             pos_ekf = st["ekf"].x[:3].copy() if st["ekf"].initialized else None
@@ -821,20 +895,44 @@ def main():
             cv2.putText(vis, f"{label}  [{status}]  {st['fps'].fps:.0f} fps",
                         (8, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
 
+            # ── Tag ground-calibration indicator ──────────────────────────────
+            _h, _pr = _pose["height"], _pose["pitch_rad"]
+            _age    = _pose["age"]
+            if _tag_active:
+                if _age == 0:
+                    _tag_col = (0, 230, 0)
+                    _tag_lbl = (f"TAG OK  H={_h:.2f}m  P={np.degrees(_pr):.1f}°")
+                elif _age < TAG_STALE_FRAMES:
+                    _tag_col = (0, 165, 255)
+                    _tag_lbl = (f"TAG [{_age}f]  H={_h:.2f}m  P={np.degrees(_pr):.1f}°")
+                else:
+                    _tag_col = (0, 0, 220)
+                    _tag_lbl = (f"NO TAG  H={_h:.2f}m  P={np.degrees(_pr):.1f}°")
+                cv2.putText(vis, _tag_lbl,
+                            (8, 52), cv2.FONT_HERSHEY_SIMPLEX, 0.5, _tag_col, 1)
+                # Draw tag outline + coordinate axes when recently seen
+                if _age < 10 and _pose["corners"] is not None:
+                    cv2.polylines(vis,
+                                  [_pose["corners"].reshape(-1, 1, 2)],
+                                  True, _tag_col, 2)
+                    if _pose["rvec"] is not None:
+                        cv2.drawFrameAxes(vis, _cam_mat, _dist,
+                                          _pose["rvec"], _pose["tvec"],
+                                          tag_size_m * 0.5)
+
             if cx is not None and miss <= COAST_FRAMES:
                 col = (0, 255, 0) if detected else (0, 165, 255)
                 cv2.circle(vis, (cx, cy), max(int(r), 3), col, 2)
                 cv2.circle(vis, (cx, cy), 3, (0, 0, 255), -1)
-                tag = "ball" if detected else f"coast {miss}/{COAST_FRAMES}"
-                cv2.putText(vis, f"{tag} r={r:.0f}px",
+                btag = "ball" if detected else f"coast {miss}/{COAST_FRAMES}"
+                cv2.putText(vis, f"{btag} r={r:.0f}px",
                             (cx - int(r), max(cy - int(r) - 6, 46)),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.45, col, 1)
                 if pos_ekf is not None:
-                    # Z label: world frame shows height above ground, body frame shows raw Z
-                    z_suffix = " agl" if use_world else ""
+                    z_suffix = " agl" if _h > 0.01 else ""
                     cv2.putText(vis,
                                 f"({pos_ekf[0]:+.2f},{pos_ekf[1]:+.2f},{pos_ekf[2]:+.2f})m{z_suffix}",
-                                (cx - int(r), max(cy - int(r) - 20, 60)),
+                                (cx - int(r), max(cy - int(r) - 20, 68)),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.38, col, 1)
                 cv2.putText(vis, f"d={depth_fused:.2f}m",
                             (8, vis.shape[0] - 8),
@@ -850,8 +948,7 @@ def main():
                 prev_px  = None
                 last_z   = traj_pts[0][1][2] if traj_pts else 1.0
                 for _, pt in traj_pts:
-                    # EKF rollout is in world frame; project back to image via body frame
-                    pt_body = world_to_body(pt, cam_height, cam_pitch_rad) if use_world else pt
+                    pt_body = world_to_body(pt, _h, _pr) if _h > 0.01 else pt
                     px = _body_to_pixel(pt_body, color_intrin)
                     if px is None:
                         prev_px = None; continue
@@ -885,6 +982,41 @@ def main():
             depth_arr = np.asanyarray(df.get_data()).copy()
             t_now     = time.perf_counter()
 
+            # ── Per-frame AprilTag ground calibration ──────────────────────────
+            _pose["age"] = min(_pose["age"] + 1, 9999)
+            if _tag_active:
+                try:
+                    corners, ids, _ = _detect_markers(color)
+                except Exception:
+                    corners, ids = [], None
+                if ids is not None:
+                    for _i, _tid in enumerate(ids.flatten()):
+                        if int(_tid) != args.tag_id:
+                            continue
+                        _img_pts = corners[_i][0].astype(np.float32)
+                        _ok, _rvec, _tvec = cv2.solvePnP(
+                            _tag_obj, _img_pts, _cam_mat, _dist,
+                            flags=cv2.SOLVEPNP_IPPE_SQUARE)
+                        if not _ok:
+                            continue
+                        _R, _ = cv2.Rodrigues(_rvec)
+                        # Camera origin in tag (world) frame
+                        _t_cam = -(_R.T @ _tvec.flatten())
+                        _new_h = float(_t_cam[2])
+                        # Camera optical +Z (forward) in world frame → extract pitch
+                        _look  = _R.T @ np.array([0.0, 0.0, 1.0])
+                        _new_p = float(np.arcsin(np.clip(_look[2], -1.0, 1.0)))
+                        # Sanity check: height must be physically plausible
+                        if 0.05 < _new_h < 3.0:
+                            a = TAG_EMA
+                            _pose["height"]    = a * _new_h + (1 - a) * _pose["height"]
+                            _pose["pitch_rad"] = a * _new_p + (1 - a) * _pose["pitch_rad"]
+                            _pose["age"]       = 0
+                            _pose["corners"]   = corners[_i][0].astype(np.int32)
+                            _pose["rvec"]      = _rvec
+                            _pose["tvec"]      = _tvec
+                        break   # use first matching tag per frame
+
             panels      = []
             term_parts  = []
 
@@ -895,7 +1027,7 @@ def main():
                 st["fps"].tick()
 
                 # terminal line segment
-                z_tag = "agl" if use_world else "body"
+                z_tag = "agl" if _pose["height"] > 0.01 else "body"
                 p_str  = "—" if pos_ekf is None else (
                     f"({pos_ekf[0]:+.2f},{pos_ekf[1]:+.2f},{pos_ekf[2]:+.2f}){z_tag}")
                 status = "BALL " if detected else ("COAST" if coasting else "     ")
