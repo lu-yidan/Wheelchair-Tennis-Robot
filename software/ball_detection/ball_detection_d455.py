@@ -946,17 +946,14 @@ def main():
                 cv2.circle(vis, (cx, cy), 3, (0, 0, 255), -1)
                 btag = "ball" if detected else f"coast {miss}/{COAST_FRAMES}"
                 cv2.putText(vis, f"{btag} r={r:.0f}px",
-                            (cx - int(r), max(cy - int(r) - 6, 46)),
+                            (cx - int(r), max(cy - int(r) - 6, 68)),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.45, col, 1)
                 if pos_ekf is not None:
                     z_suffix = " agl" if _h > 0.01 else ""
                     cv2.putText(vis,
                                 f"({pos_ekf[0]:+.2f},{pos_ekf[1]:+.2f},{pos_ekf[2]:+.2f})m{z_suffix}",
-                                (cx - int(r), max(cy - int(r) - 20, 68)),
+                                (cx - int(r), max(cy - int(r) - 20, 84)),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.38, col, 1)
-                cv2.putText(vis, f"d={depth_fused:.2f}m",
-                            (8, vis.shape[0] - 8),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
             else:
                 cv2.putText(vis, "No ball",
                             (20, vis.shape[0] // 2),
@@ -977,6 +974,41 @@ def main():
                     if prev_px is not None:
                         cv2.line(vis, prev_px, px, (0, 60, 255), 1)
                     prev_px = px; last_z = pt[2]
+
+            # ── EKF debug status bar (bottom strip) ───────────────────────────
+            _BAR_H = 52
+            _fy    = vis.shape[0] - _BAR_H
+            cv2.rectangle(vis, (0, _fy), (vis.shape[1], vis.shape[0]), (18, 18, 18), -1)
+
+            if pos_ekf is not None:
+                _px, _py, _pz = pos_ekf
+                _vx, _vy, _vz = st["ekf"].x[3:6]
+                # Z colour: green ≈ ground, yellow = small offset, red = large offset
+                _zc = ((0, 210, 0)   if abs(_pz) < 0.05 else
+                       (0, 200, 255) if abs(_pz) < 0.20 else
+                       (0, 60,  220))
+                _zs = ("Z OK" if abs(_pz) < 0.05 else
+                       "Z ~"  if abs(_pz) < 0.20 else "Z !")
+                # Row 1: position
+                cv2.putText(vis,
+                            f"POS  X={_px:+.3f}  Y={_py:+.3f}  Z=",
+                            (8, _fy + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1)
+                _tw = cv2.getTextSize(f"POS  X={_px:+.3f}  Y={_py:+.3f}  Z=",
+                                      cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)[0][0]
+                cv2.putText(vis, f"{_pz:+.3f} m",
+                            (8 + _tw, _fy + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55, _zc, 2)
+                # Row 2: velocity + depth
+                cv2.putText(vis,
+                            f"VEL  Vx={_vx:+.2f}  Vy={_vy:+.2f}  Vz={_vz:+.2f} m/s"
+                            f"    depth={depth_fused:.2f} m",
+                            (8, _fy + 42), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (160, 160, 160), 1)
+                # Right-side Z indicator
+                cv2.putText(vis, _zs,
+                            (vis.shape[1] - 90, _fy + 32),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.80, _zc, 2)
+            else:
+                cv2.putText(vis, "EKF: waiting for first detection…",
+                            (8, _fy + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (100, 100, 100), 1)
 
             # HSV mask side-by-side (only in single HSV mode with --show-mask)
             if args.show_mask and mask is not None and args.detector == "hsv":
