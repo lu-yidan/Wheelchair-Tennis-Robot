@@ -28,7 +28,7 @@ import cv2
 import pyrealsense2 as rs
 
 # ── defaults (match d455.yaml) ────────────────────────────────────────────────
-DEF = dict(h_low=25, h_high=80, s_min=80, v_min=80,
+DEF = dict(h_low=25, h_high=80, s_min=100, v_min=100,
            mog2_thr=50, min_r=3, circ=55,   # circ is circularity × 100
            motion=True)                      # MOG2 on/off toggle
 
@@ -308,6 +308,8 @@ def main():
     back_sub      = cv2.createBackgroundSubtractorMOG2(
         history=100, varThreshold=DEF['mog2_thr'], detectShadows=False)
     prev_mog2_thr = DEF['mog2_thr']
+    fps_t0        = time.time()
+    fps_smooth    = 0.0
 
     # pre-compute resize target for 2×2 grid panels
     pw = args.width  // 2
@@ -329,6 +331,12 @@ def main():
             min_r     = max(p['min_r'], 1)
             circ      = p['circ'] / 100.0
             use_motion = p['motion']
+
+            # ── FPS ───────────────────────────────────────────────────────────
+            t_now      = time.time()
+            fps_smooth = (0.85 * fps_smooth + 0.15 / max(t_now - fps_t0, 1e-6)
+                          if fps_smooth > 0 else 1.0 / max(t_now - fps_t0, 1e-6))
+            fps_t0     = t_now
 
             color     = np.asanyarray(cf.get_data()).copy()
             depth_arr = np.asanyarray(df.get_data())
@@ -366,9 +374,9 @@ def main():
             # ── Detect candidates ─────────────────────────────────────────────
             contours, _ = cv2.findContours(combined, cv2.RETR_EXTERNAL,
                                            cv2.CHAIN_APPROX_SIMPLE)
-            vis  = color.copy()
-            best = None
-            n_pass = 0
+            vis_raw = color.copy()
+            best    = None
+            n_pass  = 0
 
             for cnt in contours:
                 area = cv2.contourArea(cnt)
@@ -381,16 +389,17 @@ def main():
                 (cx_f, cy_f), r = cv2.minEnclosingCircle(cnt)
                 if r < min_r or r > 200:
                     continue
-                # draw all candidates grey
-                cv2.circle(vis, (int(cx_f), int(cy_f)), int(r), (80, 80, 80), 1)
+                cv2.circle(vis_raw, (int(cx_f), int(cy_f)), int(r), (80, 80, 80), 1)
                 if c >= circ:
                     n_pass += 1
                     score = area * c
                     if best is None or score > best[0]:
                         best = (score, int(cx_f), int(cy_f), r, c)
 
-            # ── Annotate colour panel ─────────────────────────────────────────
+            # ── Compute ball 3D position ──────────────────────────────────────
             depth_m = 0.0
+            p3d     = None
+            bx = by = br = bc = 0
             if best is not None:
                 _, bx, by, br, bc = best
                 depth_vis  = fx * BALL_RADIUS / br if br > 0 else 0.0
@@ -398,60 +407,90 @@ def main():
                                        np.clip(bx, 0, depth_arr.shape[1]-1)]
                 depth_sens = d_raw * depth_scale + BALL_RADIUS if d_raw > 0 else 0.0
                 depth_m    = depth_vis if depth_vis > 0 else depth_sens
-                cv2.circle(vis, (bx, by), int(br), (0, 255, 0), 2)
-                cv2.circle(vis, (bx, by), 3, (0, 0, 255), -1)
-                cv2.putText(vis, f"BALL  r={br:.0f}px  d={depth_m:.2f}m  c={bc:.2f}",
-                            (bx - int(br), max(by - int(br) - 6, 18)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1)
-            else:
-                cv2.putText(vis, "No ball",
-                            (20, h_ // 2),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 2)
+                if depth_m > 0:
+                    p3d = rs.rs2_deproject_pixel_to_point(
+                        color_intrin, [float(bx), float(by)], depth_m)
 
-            cv2.putText(vis,
-                        f"H=[{h_low},{h_high}] S>={s_min} V>={v_min} "
-                        f"MOG2={mog2_t} r>={min_r} circ>={circ:.2f}",
-                        (8, h_ - 8),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.38, (255, 255, 0), 1)
-            cv2.putText(vis, "1 Color+detect",
-                        (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-
-            # ── Colorize mask panels ──────────────────────────────────────────
+            # ── Colorize mask panels (circles only, no text yet) ─────────────
             hsv_disp = cv2.cvtColor(hsv_mask, cv2.COLOR_GRAY2BGR)
             hsv_disp[hsv_mask > 0] = [0, 220, 220]
-            cv2.putText(hsv_disp,
-                        f"2 HSV mask  H=[{h_low},{h_high}] S>={s_min} V>={v_min}",
-                        (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
-            # Panel 3: MOG2 mask — always shown even when filter is OFF
             mot_disp = cv2.cvtColor(motion_mask, cv2.COLOR_GRAY2BGR)
             mot_disp[motion_mask > 0] = [200, 80, 0]
-            mot_label = f"3 MOG2 motion  thr={mog2_t}"
             if not use_motion:
-                mot_label += "  [NOT APPLIED]"
-                cv2.rectangle(mot_disp, (0, 0), (mot_disp.shape[1], mot_disp.shape[0]),
-                              (0, 0, 80), 6)   # red border = disabled
-            cv2.putText(mot_disp, mot_label,
-                        (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                cv2.rectangle(mot_disp, (0, 0),
+                              (mot_disp.shape[1], mot_disp.shape[0]),
+                              (0, 0, 80), 8)
 
-            # Panel 4: combined result
             comb_disp = cv2.cvtColor(combined, cv2.COLOR_GRAY2BGR)
             comb_disp[combined > 0] = [0, 200, 80]
             if best is not None:
-                _, bx, by, br, _ = best
                 cv2.circle(comb_disp, (bx, by), int(br), (0, 255, 0), 2)
-            comb_mode = "HSV+MOG2" if use_motion else "HSV only"
-            cv2.putText(comb_disp,
-                        f"4 {comb_mode}  cands={len(contours)}  passing={n_pass}",
-                        (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
-            # ── Tile 2×2 and encode as JPEG ───────────────────────────────────
+            # ── Scale to panel size, annotate at readable resolution ──────────
             def _s(img):
                 return cv2.resize(img, (pw, ph), interpolation=cv2.INTER_AREA)
 
+            p1 = _s(vis_raw)
+            p2 = _s(hsv_disp)
+            p3 = _s(mot_disp)
+            p4 = _s(comb_disp)
+
+            FS  = 0.55              # font scale on panel-size image (readable)
+            TK  = 1
+            WHT = (255, 255, 255)
+            GRN = (0, 255, 0)
+
+            # Panel 1 ─ color + detect
+            cv2.putText(p1, f"1 Color+detect  {fps_smooth:.1f} FPS",
+                        (8, 20), cv2.FONT_HERSHEY_SIMPLEX, FS, WHT, TK)
+            if best is not None:
+                bx_p = round(bx * pw / w_)
+                by_p = round(by * ph / h_)
+                br_p = max(round(br * pw / w_), 2)
+                cv2.circle(p1, (bx_p, by_p), br_p, GRN, 2)
+                cv2.circle(p1, (bx_p, by_p), 3, (0, 0, 255), -1)
+                if p3d is not None:
+                    xyz = f"X={p3d[0]:+.3f} Y={p3d[1]:+.3f} Z={p3d[2]:.3f} m"
+                else:
+                    xyz = f"Z={depth_m:.3f} m"
+                cv2.putText(p1, f"BALL  {xyz}",
+                            (8, 42), cv2.FONT_HERSHEY_SIMPLEX, FS, GRN, TK)
+                info_y = max(by_p - br_p - 6, 60)
+                cv2.putText(p1, f"r={br:.0f}px  d={depth_m:.2f}m  c={bc:.2f}",
+                            (max(bx_p - br_p, 4), info_y),
+                            cv2.FONT_HERSHEY_SIMPLEX, FS * 0.85, GRN, TK)
+            else:
+                cv2.putText(p1, "No ball",
+                            (8, p1.shape[0] // 2),
+                            cv2.FONT_HERSHEY_SIMPLEX, FS * 1.2, (0, 80, 255), 2)
+            cv2.putText(p1,
+                        f"H=[{h_low},{h_high}] S>={s_min} V>={v_min}  "
+                        f"r>={min_r}  circ>={circ:.2f}",
+                        (8, p1.shape[0] - 8),
+                        cv2.FONT_HERSHEY_SIMPLEX, FS * 0.75, (200, 200, 0), TK)
+
+            # Panel 2 ─ HSV mask
+            cv2.putText(p2,
+                        f"2 HSV  H=[{h_low},{h_high}] S>={s_min} V>={v_min}",
+                        (8, 20), cv2.FONT_HERSHEY_SIMPLEX, FS, WHT, TK)
+
+            # Panel 3 ─ MOG2 motion (always shown)
+            mot_label = f"3 MOG2  thr={mog2_t}"
+            if not use_motion:
+                mot_label += "  [NOT APPLIED]"
+            cv2.putText(p3, mot_label,
+                        (8, 20), cv2.FONT_HERSHEY_SIMPLEX, FS, WHT, TK)
+
+            # Panel 4 ─ combined result
+            comb_mode = "HSV+MOG2" if use_motion else "HSV only"
+            cv2.putText(p4, f"4 {comb_mode}  cands={len(contours)}  pass={n_pass}",
+                        (8, 20), cv2.FONT_HERSHEY_SIMPLEX, FS, WHT, TK)
+
+            # ── Tile 2×2 and encode as JPEG ───────────────────────────────────
             composite = np.vstack([
-                np.hstack([_s(vis),      _s(hsv_disp)]),
-                np.hstack([_s(mot_disp), _s(comb_disp)]),
+                np.hstack([p1, p2]),
+                np.hstack([p3, p4]),
             ])
 
             # Scale down for browser if frame is large
