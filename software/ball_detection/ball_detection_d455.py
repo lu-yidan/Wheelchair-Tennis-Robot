@@ -799,12 +799,12 @@ def main():
                     return cv2.aruco.detectMarkers(img, _aruco_dict,
                                                    parameters=_aruco_params)
             # 3-D tag corners in tag frame (Z=0=ground, Z-up)
-            _half = tag_size_m / 2.0
+            _th = tag_size_m / 2.0   # tag half-size (avoid colliding with YOLO _half)
             _tag_obj = np.array([
-                [-_half,  _half, 0.0],
-                [ _half,  _half, 0.0],
-                [ _half, -_half, 0.0],
-                [-_half, -_half, 0.0],
+                [-_th,  _th, 0.0],
+                [ _th,  _th, 0.0],
+                [ _th, -_th, 0.0],
+                [-_th, -_th, 0.0],
             ], dtype=np.float32)
             _cam_mat  = np.array([
                 [color_intrin.fx, 0,               color_intrin.ppx],
