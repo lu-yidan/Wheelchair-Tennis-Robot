@@ -501,8 +501,13 @@ def _load_config(path):
 
     # AprilTag ground calibration
     _get("tag_family",  str,   "tag_family")
-    _get("tag_id",      int,   "tag_id")
     _get("tag_size_m",  float, "tag_size_m")
+    # tag_ids accepts a list [1,2,3] or a single int
+    if "tag_ids" in cfg:
+        raw = cfg["tag_ids"]
+        out["tag_ids"] = list(raw) if isinstance(raw, list) else [int(raw)]
+    elif "tag_id" in cfg:
+        out["tag_ids"] = [int(cfg["tag_id"])]
 
     # HSV detection thresholds
     _get("mog2_threshold", int,   "mog2_threshold")
@@ -575,8 +580,8 @@ def main():
                         help="camera pitch in degrees; negative = looking down (cold-start value)")
     parser.add_argument("--tag-family",   default="tag36h11",
                         help="ArUco/AprilTag family  (tag36h11 | tag25h9 | tag16h5)")
-    parser.add_argument("--tag-id",       type=int, default=0,
-                        help="AprilTag ID to detect for ground calibration")
+    parser.add_argument("--tag-ids",      default=[0], type=lambda s: [int(x) for x in s.split(",")],
+                        help="comma-separated AprilTag IDs to accept, e.g. --tag-ids 1,2,3")
     parser.add_argument("--tag-size-m",   type=float, default=0.0,
                         help="Physical tag size — black-square outer edge in metres; "
                              "0 = disable tag-based calibration")
@@ -633,7 +638,7 @@ def main():
               f"pitch={args.camera_pitch:.1f}°  → Z=0=ground, bounce prediction active")
         if tag_size_m > 0.01:
             print(f"[INFO] AprilTag calibration: family={args.tag_family}  "
-                  f"id={args.tag_id}  size={tag_size_m:.3f}m  (updates height+pitch per frame)")
+                  f"ids={args.tag_ids}  size={tag_size_m:.3f}m  (updates height+pitch per frame)")
         else:
             print("[INFO] AprilTag calibration: disabled (--tag-size-m not set)")
     else:
@@ -827,7 +832,7 @@ def main():
                 [0,               0,                1               ],
             ], dtype=np.float32)
             _dist     = np.array(color_intrin.coeffs[:5], dtype=np.float32)
-            print(f"[INFO] ArUco detector ready: {args.tag_family} id={args.tag_id} "
+            print(f"[INFO] ArUco detector ready: {args.tag_family} ids={args.tag_ids} "
                   f"size={tag_size_m:.3f}m")
 
         video_writer = [None]
@@ -1005,32 +1010,35 @@ def main():
                 except Exception:
                     corners, ids = [], None
                 if ids is not None:
+                    # Among all accepted tag IDs visible this frame, pick the
+                    # largest (= closest to camera = best solvePnP accuracy)
+                    _best_area, _best_i = -1.0, -1
                     for _i, _tid in enumerate(ids.flatten()):
-                        if int(_tid) != args.tag_id:
+                        if int(_tid) not in args.tag_ids:
                             continue
-                        _img_pts = corners[_i][0].astype(np.float32)
+                        _area = cv2.contourArea(corners[_i][0])
+                        if _area > _best_area:
+                            _best_area, _best_i = _area, _i
+
+                    if _best_i >= 0:
+                        _img_pts = corners[_best_i][0].astype(np.float32)
                         _ok, _rvec, _tvec = cv2.solvePnP(
                             _tag_obj, _img_pts, _cam_mat, _dist,
                             flags=cv2.SOLVEPNP_IPPE_SQUARE)
-                        if not _ok:
-                            continue
-                        _R, _ = cv2.Rodrigues(_rvec)
-                        # Camera origin in tag (world) frame
-                        _t_cam = -(_R.T @ _tvec.flatten())
-                        _new_h = float(_t_cam[2])
-                        # Camera optical +Z (forward) in world frame → extract pitch
-                        _look  = _R.T @ np.array([0.0, 0.0, 1.0])
-                        _new_p = float(np.arcsin(np.clip(_look[2], -1.0, 1.0)))
-                        # Sanity check: height must be physically plausible
-                        if 0.05 < _new_h < 3.0:
-                            a = TAG_EMA
-                            _pose["height"]    = a * _new_h + (1 - a) * _pose["height"]
-                            _pose["pitch_rad"] = a * _new_p + (1 - a) * _pose["pitch_rad"]
-                            _pose["age"]       = 0
-                            _pose["corners"]   = corners[_i][0].astype(np.int32)
-                            _pose["rvec"]      = _rvec
-                            _pose["tvec"]      = _tvec
-                        break   # use first matching tag per frame
+                        if _ok:
+                            _R, _ = cv2.Rodrigues(_rvec)
+                            _t_cam = -(_R.T @ _tvec.flatten())
+                            _new_h = float(_t_cam[2])
+                            _look  = _R.T @ np.array([0.0, 0.0, 1.0])
+                            _new_p = float(np.arcsin(np.clip(_look[2], -1.0, 1.0)))
+                            if 0.05 < _new_h < 3.0:
+                                a = TAG_EMA
+                                _pose["height"]    = a * _new_h + (1 - a) * _pose["height"]
+                                _pose["pitch_rad"] = a * _new_p + (1 - a) * _pose["pitch_rad"]
+                                _pose["age"]       = 0
+                                _pose["corners"]   = corners[_best_i][0].astype(np.int32)
+                                _pose["rvec"]      = _rvec
+                                _pose["tvec"]      = _tvec
 
             panels      = []
             term_parts  = []
