@@ -33,6 +33,7 @@ Usage:
 """
 
 import argparse
+import os
 import threading
 import time
 import numpy as np
@@ -421,40 +422,137 @@ class _FPS:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  Config loader
+# ══════════════════════════════════════════════════════════════════════════════
+
+_DEFAULT_CONFIG = os.path.join(os.path.dirname(__file__), "config", "d455.yaml")
+
+
+def _load_config(path):
+    """Read d455.yaml and return {argparse_dest: value} for parser.set_defaults().
+
+    YAML uses positive boolean names (viz, motion, traj); this function inverts
+    them to match the argparse store_true dest names (no_viz, no_motion, no_traj).
+    Missing keys are silently skipped — code defaults remain in effect.
+    """
+    try:
+        import yaml
+    except ImportError:
+        print("[WARN] PyYAML not installed; config file ignored.  pip install pyyaml")
+        return {}
+    try:
+        with open(path) as f:
+            cfg = yaml.safe_load(f) or {}
+    except FileNotFoundError:
+        return {}
+    except Exception as e:
+        print(f"[WARN] Cannot read config {path}: {e}")
+        return {}
+
+    out = {}
+
+    def _get(key, cast, dest):
+        if key in cfg:
+            out[dest] = cast(cfg[key])
+
+    # Resolution
+    _get("width",  int,   "width")
+    _get("height", int,   "height")
+
+    # Ground / world frame
+    _get("camera_height", float, "camera_height")
+    _get("camera_pitch",  float, "camera_pitch")
+
+    # Detection backend
+    _get("detector", str, "detector")
+
+    # HSV
+    _get("h_low",  int, "h_low")
+    _get("h_high", int, "h_high")
+    _get("s_min",  int, "s_min")
+    _get("v_min",  int, "v_min")
+
+    # Motion filter — YAML key is positive; argparse dest is negated
+    if "motion" in cfg:
+        out["no_motion"] = not bool(cfg["motion"])
+
+    # YOLO
+    _get("yolo_model", str,   "model")
+    _get("yolo_imgsz", int,   "imgsz")
+    _get("yolo_conf",  float, "conf")
+
+    # Physics
+    _get("coeff_drag", float, "coeff_drag")
+    _get("rest_x",     float, "rest_x")
+    _get("rest_y",     float, "rest_y")
+    _get("rest_z",     float, "rest_z")
+
+    # Visualisation — YAML positive, argparse negated
+    if "viz" in cfg:
+        out["no_viz"] = not bool(cfg["viz"])
+    _get("show_mask", bool, "show_mask")
+    if "traj" in cfg:
+        out["no_traj"] = not bool(cfg["traj"])
+
+    # Recording: false→None, true→"" (auto name), "path.mp4"→"path.mp4"
+    if "record" in cfg:
+        rec = cfg["record"]
+        if rec is False or rec is None:
+            out["record"] = None
+        elif rec is True:
+            out["record"] = ""
+        else:
+            out["record"] = str(rec)
+
+    return out
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  Main
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main():
+    # ── Pass 1: find --config path before building the full parser ────────────
+    _pre = argparse.ArgumentParser(add_help=False)
+    _pre.add_argument("--config", default=_DEFAULT_CONFIG)
+    _pre_args, _ = _pre.parse_known_args()
+    _cfg = _load_config(_pre_args.config)
+    if _cfg:
+        print(f"[INFO] Config loaded: {_pre_args.config}")
+
+    # ── Pass 2: full parser — config values become defaults, CLI overrides ────
     parser = argparse.ArgumentParser(
         description="RealSense D455 tennis ball detection + physics EKF trajectory prediction")
-    parser.add_argument("--no-viz",      action="store_true", help="disable OpenCV window")
-    parser.add_argument("--show-mask",   action="store_true", help="overlay HSV+motion mask")
-    parser.add_argument("--no-motion",   action="store_true", help="disable MOG2 motion filter")
-    parser.add_argument("--no-traj",     action="store_true", help="disable trajectory prediction overlay")
-    parser.add_argument("--width",       type=int, default=1280)
-    parser.add_argument("--height",      type=int, default=720)
-    parser.add_argument("--h-low",       type=int, default=HSV_H_LOW,  help="HSV hue lower bound")
-    parser.add_argument("--h-high",      type=int, default=HSV_H_HIGH, help="HSV hue upper bound")
-    parser.add_argument("--s-min",       type=int, default=HSV_S_MIN,  help="HSV saturation min")
-    parser.add_argument("--v-min",       type=int, default=HSV_V_MIN,  help="HSV value min")
-    parser.add_argument("--coeff-drag",  type=float, default=DEFAULT_COEFF_DRAG)
-    parser.add_argument("--rest-x",      type=float, default=DEFAULT_COEFF_REST_X)
-    parser.add_argument("--rest-y",      type=float, default=DEFAULT_COEFF_REST_Y)
-    parser.add_argument("--rest-z",      type=float, default=DEFAULT_COEFF_REST_Z)
-    parser.add_argument("--detector",    choices=["hsv", "yolo", "both"], default="hsv",
-                        help="detection backend: hsv (fast, colour-based) or yolo (robust, GPU)")
-    parser.add_argument("--model",       default="models/yolov8n.pt",
+    parser.add_argument("--config",       default=_DEFAULT_CONFIG,
+                        help="YAML config file (default: config/d455.yaml)")
+    parser.add_argument("--no-viz",       action="store_true", help="disable OpenCV window")
+    parser.add_argument("--show-mask",    action="store_true", help="overlay HSV+motion mask")
+    parser.add_argument("--no-motion",    action="store_true", help="disable MOG2 motion filter")
+    parser.add_argument("--no-traj",      action="store_true", help="disable trajectory prediction overlay")
+    parser.add_argument("--width",        type=int, default=1280)
+    parser.add_argument("--height",       type=int, default=720)
+    parser.add_argument("--h-low",        type=int, default=HSV_H_LOW,  help="HSV hue lower bound")
+    parser.add_argument("--h-high",       type=int, default=HSV_H_HIGH, help="HSV hue upper bound")
+    parser.add_argument("--s-min",        type=int, default=HSV_S_MIN,  help="HSV saturation min")
+    parser.add_argument("--v-min",        type=int, default=HSV_V_MIN,  help="HSV value min")
+    parser.add_argument("--coeff-drag",   type=float, default=DEFAULT_COEFF_DRAG)
+    parser.add_argument("--rest-x",       type=float, default=DEFAULT_COEFF_REST_X)
+    parser.add_argument("--rest-y",       type=float, default=DEFAULT_COEFF_REST_Y)
+    parser.add_argument("--rest-z",       type=float, default=DEFAULT_COEFF_REST_Z)
+    parser.add_argument("--detector",     choices=["hsv", "yolo", "both"], default="hsv",
+                        help="detection backend: hsv | yolo | both")
+    parser.add_argument("--model",        default="models/yolov8n.pt",
                         help="YOLO model path (auto-downloaded on first use)")
-    parser.add_argument("--imgsz",       type=int, default=480, help="YOLO inference size")
-    parser.add_argument("--conf",        type=float, default=0.3, help="YOLO confidence threshold")
-    parser.add_argument("--record",      metavar="FILE", nargs="?", const="",
+    parser.add_argument("--imgsz",        type=int, default=480, help="YOLO inference size")
+    parser.add_argument("--conf",         type=float, default=0.3, help="YOLO confidence threshold")
+    parser.add_argument("--record",       metavar="FILE", nargs="?", const="",
                         help="record annotated video; omit FILE for auto timestamp name")
     parser.add_argument("--camera-height", type=float, default=0.0,
-                        help="camera centre height above ground in metres (e.g. 1.2); "
-                             "enables world-frame EKF so Z=0=ground and bounce prediction works")
+                        help="camera centre height above ground (m); enables world-frame EKF")
     parser.add_argument("--camera-pitch",  type=float, default=0.0,
-                        help="camera pitch angle in degrees; negative = looking down (e.g. -15)")
-    args = parser.parse_args()
+                        help="camera pitch in degrees; negative = looking down (e.g. -15)")
+    parser.set_defaults(**_cfg)   # config file values override code defaults
+    args = parser.parse_args()    # CLI args override everything
 
     viz     = not args.no_viz
     hsv_low  = np.array([args.h_low,  args.s_min, args.v_min], dtype=np.uint8)
