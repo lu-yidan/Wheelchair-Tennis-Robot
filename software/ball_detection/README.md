@@ -70,6 +70,18 @@ python ball_detection_d455.py --h-low 10 --h-high 35 --s-min 170 --v-min 170
 python ball_detection_d455.py --h-low 25 --h-high 80 --s-min 80 --v-min 80
 ```
 
+Ground plane — enable world-frame EKF so Z=0 = court surface:
+
+```bash
+# Measure camera centre height above ground (e.g. 1.2 m) and mount pitch angle
+python ball_detection_d455.py --camera-height 1.2 --camera-pitch -15
+
+# Without these args the EKF runs in camera body frame and bounce is never triggered
+```
+
+Position readout changes from `body` (camera-relative) to `agl` (above ground level).
+Bounce points appear as **cyan dots** on the predicted trajectory once the ground is known.
+
 Physics tuning:
 
 ```bash

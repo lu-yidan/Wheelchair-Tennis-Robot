@@ -101,6 +101,32 @@ def body_to_optical(p_body):
     return np.array([-float(p_body[1]), -float(p_body[2]), float(p_body[0])])
 
 
+def body_to_world(p_body, height, pitch_rad):
+    """Camera body (X-fwd, Y-left, Z-up) → world (X-fwd, Y-left, Z-up, ground=Z=0).
+
+    height    : camera centre height above ground (m)
+    pitch_rad : camera pitch in radians; negative = looking down toward court
+    """
+    c, s = np.cos(pitch_rad), np.sin(pitch_rad)
+    return np.array([
+        c * p_body[0] + s * p_body[2],
+        float(p_body[1]),
+        -s * p_body[0] + c * p_body[2] + height,
+    ])
+
+
+def world_to_body(p_world, height, pitch_rad):
+    """World (ground=Z=0) → camera body frame.  Inverse of body_to_world."""
+    c, s = np.cos(pitch_rad), np.sin(pitch_rad)
+    dx = float(p_world[0])
+    dz = float(p_world[2]) - height
+    return np.array([
+        c * dx - s * dz,
+        float(p_world[1]),
+        s * dx + c * dz,
+    ])
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  Physics EKF  (ported from ball_ekf.cpp, simplified to 6-state)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -423,10 +449,23 @@ def main():
     parser.add_argument("--conf",        type=float, default=0.3, help="YOLO confidence threshold")
     parser.add_argument("--record",      metavar="FILE", nargs="?", const="",
                         help="record annotated video; omit FILE for auto timestamp name")
+    parser.add_argument("--camera-height", type=float, default=0.0,
+                        help="camera centre height above ground in metres (e.g. 1.2); "
+                             "enables world-frame EKF so Z=0=ground and bounce prediction works")
+    parser.add_argument("--camera-pitch",  type=float, default=0.0,
+                        help="camera pitch angle in degrees; negative = looking down (e.g. -15)")
     args = parser.parse_args()
 
     viz     = not args.no_viz
     hsv_low  = np.array([args.h_low,  args.s_min, args.v_min], dtype=np.uint8)
+
+    # ── World-frame transform ─────────────────────────────────────────────────
+    # When camera-height is given, the EKF runs in world frame (Z=0 = ground)
+    # so bounce prediction and the Z display are physically meaningful.
+    # Without it, the EKF runs in camera body frame (old behaviour, no bounce).
+    cam_height    = args.camera_height
+    cam_pitch_rad = np.radians(args.camera_pitch)
+    use_world     = cam_height > 0.01   # treat <1 cm as "not set"
     hsv_high = np.array([args.h_high, 255,        255       ], dtype=np.uint8)
 
     rec_path = None
@@ -442,6 +481,12 @@ def main():
         print(f"[INFO] YOLO model: {args.model}  imgsz={args.imgsz}  conf={args.conf}")
     print(f"[INFO] Physics: drag={args.coeff_drag:.3f}  "
           f"rest=({args.rest_x:.2f}, {args.rest_y:.2f}, {args.rest_z:.2f})")
+    if use_world:
+        print(f"[INFO] World frame ON: camera height={cam_height:.2f} m  "
+              f"pitch={args.camera_pitch:.1f}°  → Z=0 = ground, bounce prediction active")
+    else:
+        print("[INFO] World frame OFF (--camera-height not set) → "
+              "EKF in camera body frame, bounce prediction disabled")
 
     # ── RealSense pipeline ────────────────────────────────────────────────────
     pipeline   = rs.pipeline()
@@ -603,7 +648,9 @@ def main():
 
         # ── Depth + EKF closure  (identical pipeline for every detector) ──────
         def _process(cx_new, cy_new, r_new, st, t_now):
-            """Update st with one new detection result. Returns (detected, coasting, pos_body, depth_fused)."""
+            """Update st with one new detection result. Returns (detected, coasting, pos_ekf, depth_fused).
+            pos_ekf is in world frame when use_world=True, camera body frame otherwise.
+            """
             if cx_new is not None:
                 st["miss"] = 0
                 st["cx"], st["cy"], st["r"] = cx_new, cy_new, r_new
@@ -658,13 +705,15 @@ def main():
                 p_opt  = rs.rs2_deproject_pixel_to_point(
                     color_intrin, [st["cx"], st["cy"]], depth_fused)
                 p_body = optical_to_body(p_opt)
-                st["ekf"].update(p_body, _meas_covariance(depth_fused), t_now)
+                # Convert to world frame (Z=0=ground) if camera geometry is known
+                p_ekf  = body_to_world(p_body, cam_height, cam_pitch_rad) if use_world else p_body
+                st["ekf"].update(p_ekf, _meas_covariance(depth_fused), t_now)
 
-            pos_body = st["ekf"].x[:3].copy() if st["ekf"].initialized else None
-            return detected, coasting, pos_body, depth_fused
+            pos_ekf = st["ekf"].x[:3].copy() if st["ekf"].initialized else None
+            return detected, coasting, pos_ekf, depth_fused
 
         # ── Annotation closure (per-panel) ────────────────────────────────────
-        def _annotate(frame, st, mask, label, detected, coasting, pos_body, depth_fused):
+        def _annotate(frame, st, mask, label, detected, coasting, pos_ekf, depth_fused):
             vis  = frame.copy()
             cx, cy, r, miss = st["cx"], st["cy"], st["r"], st["miss"]
 
@@ -682,9 +731,11 @@ def main():
                 cv2.putText(vis, f"{tag} r={r:.0f}px",
                             (cx - int(r), max(cy - int(r) - 6, 46)),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.45, col, 1)
-                if pos_body is not None:
+                if pos_ekf is not None:
+                    # Z label: world frame shows height above ground, body frame shows raw Z
+                    z_suffix = " agl" if use_world else ""
                     cv2.putText(vis,
-                                f"({pos_body[0]:+.2f},{pos_body[1]:+.2f},{pos_body[2]:+.2f})m",
+                                f"({pos_ekf[0]:+.2f},{pos_ekf[1]:+.2f},{pos_ekf[2]:+.2f})m{z_suffix}",
                                 (cx - int(r), max(cy - int(r) - 20, 60)),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.38, col, 1)
                 cv2.putText(vis, f"d={depth_fused:.2f}m",
@@ -701,7 +752,9 @@ def main():
                 prev_px  = None
                 last_z   = traj_pts[0][1][2] if traj_pts else 1.0
                 for _, pt in traj_pts:
-                    px = _body_to_pixel(pt, color_intrin)
+                    # EKF rollout is in world frame; project back to image via body frame
+                    pt_body = world_to_body(pt, cam_height, cam_pitch_rad) if use_world else pt
+                    px = _body_to_pixel(pt_body, color_intrin)
                     if px is None:
                         prev_px = None; continue
                     is_bounce = (last_z > 0.01 and pt[2] <= 0.01)
@@ -740,12 +793,13 @@ def main():
             for label, det_fn in _detectors:
                 st = _st[label]
                 cx, cy, r_px, mask = det_fn(color)
-                detected, coasting, pos_body, depth_fused = _process(cx, cy, r_px, st, t_now)
+                detected, coasting, pos_ekf, depth_fused = _process(cx, cy, r_px, st, t_now)
                 st["fps"].tick()
 
                 # terminal line segment
-                p_str  = "—" if pos_body is None else (
-                    f"({pos_body[0]:+.2f},{pos_body[1]:+.2f},{pos_body[2]:+.2f})")
+                z_tag = "agl" if use_world else "body"
+                p_str  = "—" if pos_ekf is None else (
+                    f"({pos_ekf[0]:+.2f},{pos_ekf[1]:+.2f},{pos_ekf[2]:+.2f}){z_tag}")
                 status = "BALL " if detected else ("COAST" if coasting else "     ")
                 term_parts.append(
                     f"[{label}:{status}] {p_str} {depth_fused:.2f}m {st['fps'].fps:.0f}fps")
@@ -753,7 +807,7 @@ def main():
                 if viz or args.show_mask or rec_path is not None:
                     panels.append(
                         _annotate(color, st, mask, label,
-                                  detected, coasting, pos_body, depth_fused))
+                                  detected, coasting, pos_ekf, depth_fused))
 
             print(f"\r{'  ||  '.join(term_parts)}", end="", flush=True)
 
