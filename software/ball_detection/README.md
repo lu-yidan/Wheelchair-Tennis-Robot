@@ -37,7 +37,9 @@ Standalone Python script — no ROS, no ZED SDK required.
 
 | File | Purpose |
 |---|---|
-| `ball_detection_d455.py` | Main script — camera, detection, EKF, visualisation |
+| `ball_detection_d455.py` | Main script — camera, detection, EKF, visualisation, MJPEG server |
+| `viz3d.py` | 3-D web viewer — Three.js trajectory + bounce visualisation, restitution sliders |
+| `webview.py` | 2-D web viewer — annotated camera feed + court top-down view |
 | `tune_hsv_web.py` | Interactive web-based HSV / MOG2 tuner (browser UI) |
 | `generate_apriltag.py` | Print an A4 AprilTag PDF for ground-plane calibration |
 | `config/d455.yaml` | All runtime parameters; CLI flags override these |
@@ -78,6 +80,28 @@ python ball_detection_d455.py --record output.mp4
 # Override HSV range on command line (CLI always wins over yaml)
 python ball_detection_d455.py --h-low 25 --h-high 80 --s-min 80 --v-min 80
 ```
+
+### Web viewers
+
+Enable in `config/d455.yaml` (or pass CLI flags) then open in a browser:
+
+```yaml
+viz3d:   true   # 3-D Three.js viewer  → http://localhost:5001
+webview: true   # 2-D camera + court   → http://localhost:5002
+```
+
+```bash
+# Terminal 1 — main detection (starts MJPEG server + UDP state broadcast)
+python ball_detection_d455.py
+
+# Terminal 2 — 3-D trajectory viewer
+python viz3d.py          # open http://localhost:5001
+
+# Terminal 3 — 2-D camera + court viewer
+python webview.py        # open http://localhost:5002
+```
+
+Both web viewers include live **restitution coefficient sliders** (rest X/Y/Z) that update the EKF bounce model in real time without restarting the detector.
 
 ---
 
@@ -157,6 +181,23 @@ show_mask: false    # show HSV+MOG2 mask panel
 traj:      true     # show predicted trajectory arc
 record:    false    # false | true (auto-name) | "filename.mp4"
 ```
+
+### Web viewers
+```yaml
+# 3-D web viewer (viz3d.py)
+viz3d:      true       # broadcast state via UDP to viz3d.py
+viz3d_port: 5565       # UDP port viz3d.py listens on
+ctrl_port:  5566       # UDP port for rest-coefficient feedback from web sliders
+
+# 2-D web viewer (webview.py)
+webview:      true     # enable state UDP + internal MJPEG server
+webview_port: 5567     # UDP state port webview.py listens on
+mjpeg_port:   5568     # HTTP port for built-in full-resolution MJPEG server
+```
+
+Video frames are served by ball_detection's **built-in MJPEG HTTP server** on `mjpeg_port`
+at full original resolution and quality — no UDP frame transfer, no size limit.
+The browser at `localhost:5002` connects directly to `localhost:5568` for the live stream.
 
 ---
 
@@ -350,6 +391,40 @@ Trajectory visualisation:
 ---
 
 ## Tools
+
+### `viz3d.py` — 3-D trajectory web viewer
+
+```bash
+python viz3d.py          # open http://localhost:5001
+python viz3d.py --port 5001 --udp-port 5565 --ctrl-port 5566
+```
+
+Three.js visualisation running in the browser — no display server required.
+
+| Element | Description |
+|---|---|
+| Orange fading line | Ball position history (recent = bright) |
+| Red line | Predicted trajectory (1 s ahead) |
+| Cyan dots | Predicted bounce points |
+| Right panel sliders | Live rest X/Y/Z — updates EKF in ball_detection instantly |
+| Connection indicator | Green = online, orange = stale, red = disconnected |
+
+---
+
+### `webview.py` — 2-D camera + court web viewer
+
+```bash
+python webview.py          # open http://localhost:5002
+python webview.py --port 5002 --udp-port 5567 --mjpeg-port 5568
+```
+
+Layout: annotated camera frame (left, full resolution) + court top-down view + info panel (right).
+
+Video is served at **full original resolution** by ball_detection's built-in MJPEG HTTP server
+(`mjpeg_port`). The browser connects directly — no intermediate re-encoding or size limit.
+Same restitution sliders and ball/velocity readout as viz3d.py.
+
+---
 
 ### `tune_hsv_web.py` — Interactive HSV tuner
 

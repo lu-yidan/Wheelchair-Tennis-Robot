@@ -73,3 +73,17 @@ traj:      true    # 显示预测弹道（红线 + 弹跳点青色圆点）
 # true         — 自动命名（ball_YYYYMMDD_HHMMSS.mp4）
 # "output.mp4" — 指定文件名
 record: false
+
+# ── 3D web 查看器（viz3d.py）────────────────────────────────────────────────
+# viz3d:      true  则启动后自动广播 UDP 状态到 viz3d.py
+# ctrl_port:  viz3d.py 用于回送 rest 控制的 UDP 端口
+viz3d:          true
+viz3d_port:     5565
+ctrl_port:      5566
+
+# ── 2D web 查看器（webview.py）──────────────────────────────────────────────
+# webview:    true 则向 webview.py 流式推送标注画面 + court 视图
+# webview_port: webview.py 监听的 UDP 端口
+webview:        true
+webview_port:   5567
+mjpeg_port:     5568     # ball_detection 内嵌 MJPEG 服务器端口（全原始分辨率）

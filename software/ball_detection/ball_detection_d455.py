@@ -33,6 +33,7 @@ Usage:
 """
 
 import argparse
+import json
 import os
 import threading
 import time
@@ -235,7 +236,10 @@ class PhysicsEKF:
         x_p = self.x.copy()
         x_p[:3] += self.x[3:] * dt + 0.5 * a * dt**2
         x_p[3:] += a * dt
-        x_p[2]   = max(x_p[2], 0.0)          # clamp to floor
+        if x_p[2] < 0:                        # floor contact: clamp pos AND vel
+            x_p[2] = 0.0
+            if x_p[5] < 0:
+                x_p[5] = 0.0
 
         F   = self._state_jacobian(self.x, dt)
         Q   = np.diag([Q_POS]*3 + [Q_VEL]*3) * dt
@@ -254,7 +258,10 @@ class PhysicsEKF:
             self.x += K @ inn
             self.P  = (np.eye(6) - K @ H) @ self.P
 
-        self.x[2] = max(self.x[2], 0.0)
+        if self.x[2] < 0:                    # same contact constraint post-correct
+            self.x[2] = 0.0
+            if self.x[5] < 0:
+                self.x[5] = 0.0
 
     def rollout(self, t_ahead=TRAJ_PREDICT_SEC, dt=DT_ROLLOUT,
                 cx=DEFAULT_COEFF_REST_X,
@@ -531,6 +538,18 @@ def _load_config(path):
         else:
             out["record"] = str(rec)
 
+    # 3-D web viewer (viz3d.py)
+    if "viz3d" in cfg:
+        out["viz3d"] = bool(cfg["viz3d"])
+    _get("viz3d_port", int, "viz3d_port")
+    _get("ctrl_port",  int, "ctrl_port")
+
+    # 2-D web viewer (webview.py)
+    if "webview" in cfg:
+        out["webview"] = bool(cfg["webview"])
+    _get("webview_port", int, "webview_port")
+    _get("mjpeg_port",   int, "mjpeg_port")
+
     return out
 
 
@@ -593,6 +612,18 @@ def main():
                         help="minimum ball radius in pixels (default 3)")
     parser.add_argument("--circularity",    type=float, default=MIN_CIRCULARITY,
                         help="minimum contour circularity 0–1 (default 0.55)")
+    parser.add_argument("--viz3d",      action="store_true",
+                        help="broadcast state via UDP for viz3d.py 3-D viewer")
+    parser.add_argument("--viz3d-port", type=int, default=5565,
+                        help="UDP port for viz3d state broadcast (default 5565)")
+    parser.add_argument("--ctrl-port",  type=int, default=5566,
+                        help="UDP port to receive rest-control from viz3d.py (default 5566)")
+    parser.add_argument("--webview",      action="store_true",
+                        help="stream annotated frames to webview.py 2-D web viewer")
+    parser.add_argument("--webview-port", type=int, default=5567,
+                        help="UDP port for state stream to webview.py (default 5567)")
+    parser.add_argument("--mjpeg-port",   type=int, default=5568,
+                        help="port for internal full-res MJPEG server (default 5568, 0=disable)")
     parser.set_defaults(**_cfg)   # config file values override code defaults
     args = parser.parse_args()    # CLI args override everything
 
@@ -610,15 +641,59 @@ def main():
     use_world     = cam_height > 0.01 or tag_size_m > 0.01
 
     _pose = {
-        "height":    cam_height,     # metres above ground; updated by tag each frame
-        "pitch_rad": cam_pitch_rad,  # radians, negative = looking down; updated by tag
+        "height":    cam_height,     # EMA-smoothed height (cold-start fallback only)
+        "pitch_rad": cam_pitch_rad,  # EMA-smoothed pitch  (cold-start fallback only)
         "age":       9999,           # frames since last successful tag detection
         "corners":   None,           # last detected tag corners (int32 Nx2) for overlay
         "rvec":      None,           # last tag rvec from solvePnP (for drawFrameAxes)
         "tvec":      None,           # last tag tvec
+        # Full rotation: tag world → camera optical frame (from solvePnP).
+        # When not None these replace the pitch-only EMA model and handle
+        # roll, yaw, and pitch simultaneously.
+        "R_cw":      None,           # 3×3 ndarray, R from solvePnP
+        "tvec_flat": None,           # tvec as 1-D (3,) ndarray
     }
 
     hsv_high = np.array([args.h_high, 255, 255], dtype=np.uint8)
+
+    # Mutable restitution coefficients — modified live by keyboard in main thread,
+    # read by detection thread in rollout().  Dict is safe under the GIL.
+    _rest = {"x": args.rest_x, "y": args.rest_y, "z": args.rest_z}
+
+    # Optional UDP socket for viz3d.py state broadcast
+    import socket as _socket_mod
+    _udp_sock = None
+    if args.viz3d:
+        _udp_sock = _socket_mod.socket(_socket_mod.AF_INET, _socket_mod.SOCK_DGRAM)
+        print(f"[INFO] viz3d UDP → localhost:{args.viz3d_port}  "
+              f"(open http://localhost:5001 after starting viz3d.py)")
+
+        # Control listener — receives rest updates from viz3d.py web sliders
+        def _ctrl_listener():
+            sock = _socket_mod.socket(_socket_mod.AF_INET, _socket_mod.SOCK_DGRAM)
+            sock.bind(("127.0.0.1", args.ctrl_port))
+            sock.settimeout(1.0)
+            while True:
+                try:
+                    data, _ = sock.recvfrom(4096)
+                    pkt = json.loads(data)
+                    if "rest" in pkt and len(pkt["rest"]) == 3:
+                        _rest["x"] = round(float(pkt["rest"][0]), 2)
+                        _rest["y"] = round(float(pkt["rest"][1]), 2)
+                        _rest["z"] = round(float(pkt["rest"][2]), 2)
+                except _socket_mod.timeout:
+                    pass
+                except Exception:
+                    pass
+
+        threading.Thread(target=_ctrl_listener, daemon=True).start()
+        print(f"[INFO] viz3d control listener on localhost:{args.ctrl_port}")
+
+    _webview_sock = None
+    if args.webview:
+        _webview_sock = _socket_mod.socket(_socket_mod.AF_INET, _socket_mod.SOCK_DGRAM)
+        print(f"[INFO] webview UDP → localhost:{args.webview_port}  "
+              f"(open http://localhost:5002 after starting webview.py)")
 
     rec_path = None
     if args.record is not None:
@@ -725,8 +800,58 @@ def main():
     buf_updated = threading.Event()
     stop_flag   = threading.Event()
 
-    disp_lock  = threading.Lock()
-    disp_frame = [None]
+    disp_lock   = threading.Lock()
+    disp_frame  = [None]
+    court_frame = [None]
+
+    # ── Internal full-resolution MJPEG server ─────────────────────────────────
+    if args.webview and getattr(args, "mjpeg_port", 0) > 0:
+        import socketserver as _mjpeg_ss
+        from http.server import BaseHTTPRequestHandler as _MJPEG_BHR, HTTPServer as _MJPEG_HS
+
+        class _MJPEGHandler(_MJPEG_BHR):
+            def log_message(self, *_): pass
+            def do_GET(self):
+                p = self.path.split("?")[0].rstrip("/")
+                if p in ("", "/main"):
+                    buf_ref = disp_frame
+                elif p == "/court":
+                    buf_ref = court_frame
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type",
+                                 "multipart/x-mixed-replace; boundary=--frame")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                try:
+                    while not stop_flag.is_set():
+                        with disp_lock:
+                            f = buf_ref[0]
+                        if f is not None:
+                            ok, enc = cv2.imencode(
+                                ".jpg", f, [cv2.IMWRITE_JPEG_QUALITY, 92])
+                            if ok:
+                                body = enc.tobytes()
+                                self.wfile.write(
+                                    b"--frame\r\nContent-Type: image/jpeg\r\n\r\n")
+                                self.wfile.write(body)
+                                self.wfile.write(b"\r\n")
+                                self.wfile.flush()
+                        time.sleep(1 / 25)
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    pass
+
+        class _MJPEGServer(_mjpeg_ss.ThreadingMixIn, _MJPEG_HS):
+            daemon_threads = True
+
+        _mjpeg_srv = _MJPEGServer(("0.0.0.0", args.mjpeg_port), _MJPEGHandler)
+        threading.Thread(target=_mjpeg_srv.serve_forever, daemon=True).start()
+        print(f"[INFO] MJPEG  → http://localhost:{args.mjpeg_port}/main  "
+              f"(full resolution, used by webview.py)")
 
     # ── Detection thread ──────────────────────────────────────────────────────
     def detection_worker():
@@ -771,10 +896,10 @@ def main():
                                 best_c, best_box = c, box
                 if best_box is None:
                     return None, None, None, None
-                x1, y1, x2, y2 = best_box.xyxy[0]
+                x1, y1, x2, y2 = [float(v) for v in best_box.xyxy[0]]
                 cx = int((x1 + x2) / 2 * sx)
                 cy = int((y1 + y2) / 2 * sy)
-                r  = max((x2 - x1) * sx, (y2 - y1) * sy) / 2
+                r  = float(max((x2 - x1) * sx, (y2 - y1) * sy) / 2)
                 return cx, cy, r, None
 
         # HSV detect function
@@ -796,13 +921,24 @@ def main():
         if args.detector in ("hsv", "both"):
             _detectors.append(("HSV",  _hsv_fn))
 
-        # Per-detector state: last position, miss counter, EKF, FPS
+        # Per-detector state: last position, miss counter, EKF, FPS, cached rollout
         _st = {
             label: {"cx": None, "cy": None, "r": None, "miss": 0,
                     "ekf": PhysicsEKF(coeff_drag=args.coeff_drag),
-                    "fps": _FPS()}
+                    "fps": _FPS(),
+                    "traj_pts": []}   # cached rollout — computed once per frame
             for label, _ in _detectors
         }
+
+        # Court-view world-frame state (written by detection loop, read by renderer)
+        _court = {
+            "ball_hist": [],   # [(x,y,z)] last 120 EKF positions in world frame
+            "traj":      [],   # [(x,y,z)] predicted trajectory in world frame
+            "bounces":   [],   # [(x,y,z)] predicted bounce points in world frame
+        }
+
+        # Per-detector ball history for UDP/web selector (label → list of (x,y,z))
+        _hist = {label: [] for label, _ in _detectors}
 
         # ── ArUco / AprilTag ground calibration ───────────────────────────────
         _tag_active = tag_size_m > 0.01
@@ -834,6 +970,147 @@ def main():
             _dist     = np.array(color_intrin.coeffs[:5], dtype=np.float32)
             print(f"[INFO] ArUco detector ready: {args.tag_family} ids={args.tag_ids} "
                   f"size={tag_size_m:.3f}m")
+
+        # ── Save restitution to yaml ──────────────────────────────────────────
+        def _save_yaml():
+            import re
+            try:
+                with open(args.config) as _f:
+                    _txt = _f.read()
+                _txt = re.sub(r"(rest_x:\s*)[\d.]+", f"rest_x: {_rest['x']:.2f}", _txt)
+                _txt = re.sub(r"(rest_y:\s*)[\d.]+", f"rest_y: {_rest['y']:.2f}", _txt)
+                _txt = re.sub(r"(rest_z:\s*)[\d.]+", f"rest_z: {_rest['z']:.2f}", _txt)
+                with open(args.config, "w") as _f:
+                    _f.write(_txt)
+                print(f"\n[INFO] Saved rest ({_rest['x']:.2f}/{_rest['y']:.2f}/{_rest['z']:.2f})"
+                      f" → {args.config}")
+            except Exception as _e:
+                print(f"\n[WARN] yaml save failed: {_e}")
+
+        # ── 2-D court view renderer ───────────────────────────────────────────
+        def _render_court_view():
+            """Two side-by-side panels: top-down (XY) and side (XZ), world frame."""
+            PANEL = 500
+            SCALE = 80          # px per metre → ±3.1 m visible range
+            MID   = PANEL // 2  # world origin in pixels
+
+            def _xy(wx, wy):    # world XY → top-down pixel (Y up on screen)
+                return (int(MID + wx * SCALE), int(MID - wy * SCALE))
+
+            def _xz(wx, wz):    # world XZ → side pixel (Z up on screen)
+                return (int(MID + wx * SCALE), int(MID - wz * SCALE))
+
+            def _in(pt):        # pixel inside panel?
+                return 0 <= pt[0] < PANEL and 0 <= pt[1] < PANEL
+
+            top  = np.full((PANEL, PANEL, 3), (28, 28, 28), dtype=np.uint8)
+            side = np.full((PANEL, PANEL, 3), (28, 28, 28), dtype=np.uint8)
+
+            # Grid lines every 0.5 m
+            for _i in range(-6, 7):
+                _m = _i * 0.5
+                _gc = (55, 55, 55) if _i % 2 else (70, 70, 70)
+                _px = int(MID + _m * SCALE); _py = int(MID - _m * SCALE)
+                cv2.line(top,  (_px, 0), (_px, PANEL), _gc, 1)
+                cv2.line(top,  (0, _py), (PANEL, _py), _gc, 1)
+                cv2.line(side, (_px, 0), (_px, PANEL), _gc, 1)
+                cv2.line(side, (0, _py), (PANEL, _py), _gc, 1)
+
+            # Ground line (Z=0) in side panel
+            cv2.line(side, (0, MID), (PANEL, MID), (50, 100, 50), 2)
+
+            # Axis arrows
+            cv2.arrowedLine(top,  _xy(0,0), _xy(1.2,0),   (80,80,220), 2, tipLength=0.08)
+            cv2.arrowedLine(top,  _xy(0,0), _xy(0,1.2),   (80,220,80), 2, tipLength=0.08)
+            cv2.arrowedLine(side, _xz(0,0), _xz(1.2,0),   (80,80,220), 2, tipLength=0.08)
+            cv2.arrowedLine(side, _xz(0,0), _xz(0,1.2),   (80,220,80), 2, tipLength=0.08)
+            cv2.putText(top,  "X", _xy(1.25,0), cv2.FONT_HERSHEY_SIMPLEX, 0.4,(80,80,220),1)
+            cv2.putText(top,  "Y", _xy(0,1.3),  cv2.FONT_HERSHEY_SIMPLEX, 0.4,(80,220,80),1)
+            cv2.putText(side, "X", _xz(1.25,0), cv2.FONT_HERSHEY_SIMPLEX, 0.4,(80,80,220),1)
+            cv2.putText(side, "Z", _xz(0,1.3),  cv2.FONT_HERSHEY_SIMPLEX, 0.4,(80,220,80),1)
+
+            # Title
+            cv2.putText(top,  "TOP (X-Y)", (6, 18),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.48, (160,160,160), 1)
+            cv2.putText(side, "SIDE (X-Z)", (6, 18),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.48, (160,160,160), 1)
+
+            # Tag at origin
+            for _p, _fn in ((top, _xy), (side, _xz)):
+                cv2.drawMarker(_p, _fn(0,0), (0,220,220),
+                               cv2.MARKER_SQUARE, 14, 2)
+
+            # Camera position + look-direction arrow
+            if _pose["R_cw"] is not None:
+                _t_cam = -(_pose["R_cw"].T @ _pose["tvec_flat"])
+                _cx, _cy, _cz = _t_cam
+                _look = _pose["R_cw"].T @ np.array([0.0, 0.0, 1.0])
+                for _p, _fn, _a1, _a2 in (
+                    (top,  _xy, _cx, _cy),
+                    (side, _xz, _cx, _cz),
+                ):
+                    _lx = _look[0]; _la = _look[1] if _fn is _xy else _look[2]
+                    _cp  = _fn(_a1, _a2)
+                    _tip = _fn(_a1 + _lx * 0.8, _a2 + _la * 0.8)
+                    cv2.circle(_p, _cp, 7, (255, 140, 50), -1)
+                    if _in(_cp) and _in(_tip):
+                        cv2.arrowedLine(_p, _cp, _tip, (255,140,50), 2, tipLength=0.25)
+                cv2.putText(top, "CAM",
+                            (_xy(_cx, _cy)[0]+9, _xy(_cx, _cy)[1]+4),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255,140,50), 1)
+
+            # Ball history trail
+            for _bx, _by, _bz in _court["ball_hist"]:
+                _pt = _xy(_bx, _by); _ps = _xz(_bx, _bz)
+                if _in(_pt): cv2.circle(top,  _pt, 2, (50,160,255), -1)
+                if _in(_ps): cv2.circle(side, _ps, 2, (50,160,255), -1)
+
+            # Predicted trajectory
+            _pp_top = _pp_side = None
+            for _bx, _by, _bz in _court["traj"]:
+                _pt = _xy(_bx, _by); _ps = _xz(_bx, _bz)
+                if _pp_top  and _in(_pt): cv2.line(top,  _pp_top,  _pt, (0,60,255), 1)
+                if _pp_side and _in(_ps): cv2.line(side, _pp_side, _ps, (0,60,255), 1)
+                _pp_top = _pt; _pp_side = _ps
+
+            # Bounce points
+            for _bx, _by, _bz in _court["bounces"]:
+                _pt = _xy(_bx, _by); _ps = _xz(_bx, _bz)
+                if _in(_pt): cv2.drawMarker(top,  _pt, (0,255,255), cv2.MARKER_CROSS,12,2)
+                if _in(_ps): cv2.drawMarker(side, _ps, (0,255,255), cv2.MARKER_CROSS,12,2)
+
+            # Rest values footer
+            _rf = f"rest  X={_rest['x']:.2f}  Y={_rest['y']:.2f}  Z={_rest['z']:.2f}"
+            _kf = "z/Z:rest_z   x/X:rest_x   y/Y:rest_y   s:save"
+            cv2.putText(top,  _rf, (6, PANEL-8),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.38, (160,180,120), 1)
+            cv2.putText(side, _kf, (6, PANEL-8),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.34, (120,120,120), 1)
+
+            _div = np.full((PANEL, 4, 3), (100,100,100), dtype=np.uint8)
+            return np.hstack([top, _div, side])
+
+        # ── World ↔ body transforms using full R matrix when available ──────────
+        def _world_active():
+            """True when a world frame (Z=0=ground) transform is available."""
+            return _pose["R_cw"] is not None or _pose["height"] > 0.01
+
+        def _to_world(p_body):
+            """Camera body frame → world frame (Z=0=ground).
+            Uses full R matrix from solvePnP when available (handles roll/yaw/pitch);
+            falls back to EMA pitch-only model when R_cw is not yet set.
+            """
+            if _pose["R_cw"] is not None:
+                p_opt = body_to_optical(p_body)
+                return _pose["R_cw"].T @ (p_opt - _pose["tvec_flat"])
+            return body_to_world(p_body, _pose["height"], _pose["pitch_rad"])
+
+        def _to_body(p_world):
+            """World frame → camera body frame.  Inverse of _to_world."""
+            if _pose["R_cw"] is not None:
+                p_opt = _pose["R_cw"] @ np.asarray(p_world) + _pose["tvec_flat"]
+                return optical_to_body(p_opt)
+            return world_to_body(p_world, _pose["height"], _pose["pitch_rad"])
 
         video_writer = [None]
 
@@ -896,9 +1173,8 @@ def main():
                 p_opt  = rs.rs2_deproject_pixel_to_point(
                     color_intrin, [st["cx"], st["cy"]], depth_fused)
                 p_body = optical_to_body(p_opt)
-                # Convert to world frame (Z=0=ground) using current tag-derived pose
-                _h, _pr = _pose["height"], _pose["pitch_rad"]
-                p_ekf  = body_to_world(p_body, _h, _pr) if _h > 0.01 else p_body
+                # Convert to world frame (Z=0=ground) using full R matrix when available
+                p_ekf = _to_world(p_body) if _world_active() else p_body
                 st["ekf"].update(p_ekf, _meas_covariance(depth_fused), t_now)
 
             pos_ekf = st["ekf"].x[:3].copy() if st["ekf"].initialized else None
@@ -919,15 +1195,25 @@ def main():
             _h, _pr = _pose["height"], _pose["pitch_rad"]
             _age    = _pose["age"]
             if _tag_active:
+                # Decompose full R into ZYX Euler angles when available
+                _R = _pose["R_cw"]
+                if _R is not None:
+                    Rt = _R.T   # camera axes in world frame
+                    _yaw_d   = np.degrees(np.arctan2(Rt[1, 0], Rt[0, 0]))
+                    _pitch_d = np.degrees(np.arcsin(np.clip(-Rt[2, 0], -1.0, 1.0)))
+                    _roll_d  = np.degrees(np.arctan2(Rt[2, 1], Rt[2, 2]))
+                    _rpy = f"R={_roll_d:+.1f}°  P={_pitch_d:+.1f}°  Y={_yaw_d:+.1f}°"
+                else:
+                    _rpy = f"P={np.degrees(_pr):+.1f}° (EMA)"
                 if _age == 0:
                     _tag_col = (0, 230, 0)
-                    _tag_lbl = (f"TAG OK  H={_h:.2f}m  P={np.degrees(_pr):.1f}°")
+                    _tag_lbl = f"TAG OK   H={_h:.2f}m  {_rpy}"
                 elif _age < TAG_STALE_FRAMES:
                     _tag_col = (0, 165, 255)
-                    _tag_lbl = (f"TAG [{_age}f]  H={_h:.2f}m  P={np.degrees(_pr):.1f}°")
+                    _tag_lbl = f"TAG [{_age}f]  H={_h:.2f}m  {_rpy}"
                 else:
                     _tag_col = (0, 0, 220)
-                    _tag_lbl = (f"NO TAG  H={_h:.2f}m  P={np.degrees(_pr):.1f}°")
+                    _tag_lbl = f"NO TAG   H={_h:.2f}m  {_rpy}"
                 cv2.putText(vis, _tag_lbl,
                             (8, 52), cv2.FONT_HERSHEY_SIMPLEX, 0.5, _tag_col, 1)
                 # Draw tag outline + coordinate axes when recently seen
@@ -949,7 +1235,7 @@ def main():
                             (cx - int(r), max(cy - int(r) - 6, 68)),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.45, col, 1)
                 if pos_ekf is not None:
-                    z_suffix = " agl" if _h > 0.01 else ""
+                    z_suffix = " agl" if _world_active() else ""
                     cv2.putText(vis,
                                 f"({pos_ekf[0]:+.2f},{pos_ekf[1]:+.2f},{pos_ekf[2]:+.2f})m{z_suffix}",
                                 (cx - int(r), max(cy - int(r) - 20, 84)),
@@ -959,13 +1245,13 @@ def main():
                             (20, vis.shape[0] // 2),
                             cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 2)
 
-            # Trajectory overlay
-            if not args.no_traj and st["ekf"].initialized:
-                traj_pts = st["ekf"].rollout(cx=args.rest_x, cy=args.rest_y, cz=args.rest_z)
+            # Trajectory overlay (use pre-computed rollout from st["traj_pts"])
+            traj_pts = st["traj_pts"]
+            if not args.no_traj and traj_pts:
                 prev_px  = None
-                last_z   = traj_pts[0][1][2] if traj_pts else 1.0
+                last_z   = traj_pts[0][1][2]
                 for _, pt in traj_pts:
-                    pt_body = world_to_body(pt, _h, _pr) if _h > 0.01 else pt
+                    pt_body = _to_body(pt) if _world_active() else pt
                     px = _body_to_pixel(pt_body, color_intrin)
                     if px is None:
                         prev_px = None; continue
@@ -976,7 +1262,7 @@ def main():
                     prev_px = px; last_z = pt[2]
 
             # ── EKF debug status bar (bottom strip) ───────────────────────────
-            _BAR_H = 52
+            _BAR_H = 68
             _fy    = vis.shape[0] - _BAR_H
             cv2.rectangle(vis, (0, _fy), (vis.shape[1], vis.shape[0]), (18, 18, 18), -1)
 
@@ -992,29 +1278,40 @@ def main():
                 # Row 1: position
                 cv2.putText(vis,
                             f"POS  X={_px:+.3f}  Y={_py:+.3f}  Z=",
-                            (8, _fy + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1)
+                            (8, _fy + 18), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (200, 200, 200), 1)
                 _tw = cv2.getTextSize(f"POS  X={_px:+.3f}  Y={_py:+.3f}  Z=",
-                                      cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)[0][0]
+                                      cv2.FONT_HERSHEY_SIMPLEX, 0.52, 1)[0][0]
                 cv2.putText(vis, f"{_pz:+.3f} m",
-                            (8 + _tw, _fy + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55, _zc, 2)
+                            (8 + _tw, _fy + 18), cv2.FONT_HERSHEY_SIMPLEX, 0.52, _zc, 2)
                 # Row 2: velocity + depth
                 cv2.putText(vis,
                             f"VEL  Vx={_vx:+.2f}  Vy={_vy:+.2f}  Vz={_vz:+.2f} m/s"
                             f"    depth={depth_fused:.2f} m",
-                            (8, _fy + 42), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (160, 160, 160), 1)
+                            (8, _fy + 38), cv2.FONT_HERSHEY_SIMPLEX, 0.47, (160, 160, 160), 1)
+                # Row 3: restitution coefficients
+                cv2.putText(vis,
+                            f"rest  X={_rest['x']:.2f}  Y={_rest['y']:.2f}  Z={_rest['z']:.2f}"
+                            f"    [x/X  y/Y  z/Z: ±0.05  |  s: save yaml]",
+                            (8, _fy + 58), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (110, 140, 110), 1)
                 # Right-side Z indicator
                 cv2.putText(vis, _zs,
-                            (vis.shape[1] - 90, _fy + 32),
+                            (vis.shape[1] - 90, _fy + 28),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.80, _zc, 2)
             else:
                 cv2.putText(vis, "EKF: waiting for first detection…",
                             (8, _fy + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (100, 100, 100), 1)
+                cv2.putText(vis,
+                            f"rest  X={_rest['x']:.2f}  Y={_rest['y']:.2f}  Z={_rest['z']:.2f}"
+                            f"    [x/X  y/Y  z/Z: ±0.05  |  s: save yaml]",
+                            (8, _fy + 52), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (110, 140, 110), 1)
 
             # HSV mask side-by-side (only in single HSV mode with --show-mask)
             if args.show_mask and mask is not None and args.detector == "hsv":
                 vis = np.hstack([vis, cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)])
 
             return vis
+
+        _court_last_t = 0.0   # throttle court_view rendering to 10 fps
 
         # ── Main loop ─────────────────────────────────────────────────────────
         while not stop_flag.is_set():
@@ -1071,6 +1368,8 @@ def main():
                                 _pose["corners"]   = corners[_best_i][0].astype(np.int32)
                                 _pose["rvec"]      = _rvec
                                 _pose["tvec"]      = _tvec
+                                _pose["R_cw"]      = _R
+                                _pose["tvec_flat"] = _tvec.flatten()
 
             panels      = []
             term_parts  = []
@@ -1081,8 +1380,16 @@ def main():
                 detected, coasting, pos_ekf, depth_fused = _process(cx, cy, r_px, st, t_now)
                 st["fps"].tick()
 
+                # Pre-compute rollout once per detector per frame (reused by
+                # _annotate overlay and court/UDP state — avoids double rollout)
+                if st["ekf"].initialized and not args.no_traj:
+                    st["traj_pts"] = st["ekf"].rollout(
+                        cx=_rest["x"], cy=_rest["y"], cz=_rest["z"])
+                else:
+                    st["traj_pts"] = []
+
                 # terminal line segment
-                z_tag = "agl" if _pose["height"] > 0.01 else "body"
+                z_tag = "agl" if _world_active() else "body"
                 p_str  = "—" if pos_ekf is None else (
                     f"({pos_ekf[0]:+.2f},{pos_ekf[1]:+.2f},{pos_ekf[2]:+.2f}){z_tag}")
                 status = "BALL " if detected else ("COAST" if coasting else "     ")
@@ -1096,7 +1403,43 @@ def main():
 
             print(f"\r{'  ||  '.join(term_parts)}", end="", flush=True)
 
-            if (viz or args.show_mask or rec_path is not None) and panels:
+            # ── Update court-view state from the first active detector ─────────
+            _first_label = _detectors[0][0]
+            _first_st    = _st[_first_label]
+            if _world_active() and _first_st["ekf"].initialized:
+                _ep = _first_st["ekf"].x[:3].copy()
+                _court["ball_hist"].append((_ep[0], _ep[1], _ep[2]))
+                if len(_court["ball_hist"]) > 120:
+                    _court["ball_hist"].pop(0)
+                # Reuse cached rollout — already computed above
+                _traj_raw = _first_st["traj_pts"]
+                _court["traj"]    = [tuple(p) for _, p in _traj_raw]
+                _court["bounces"] = []
+                _last_z = _traj_raw[0][1][2] if _traj_raw else 1.0
+                for _, _pt in _traj_raw:
+                    if _last_z > 0.01 and _pt[2] <= 0.01:
+                        _court["bounces"].append(tuple(_pt))
+                    _last_z = _pt[2]
+            elif not _world_active():
+                _court["ball_hist"].clear()
+                _court["traj"].clear()
+                _court["bounces"].clear()
+
+            # Per-detector ball history (for UDP multi-detector selector)
+            for _lbl, _ in _detectors:
+                _se = _st[_lbl]["ekf"]
+                if _world_active() and _se.initialized:
+                    _ep2 = _se.x[:3]
+                    _hist[_lbl].append((round(float(_ep2[0]),4),
+                                        round(float(_ep2[1]),4),
+                                        round(float(_ep2[2]),4)))
+                    if len(_hist[_lbl]) > 120:
+                        _hist[_lbl].pop(0)
+                elif not _world_active():
+                    _hist[_lbl].clear()
+
+            if (viz or args.show_mask or rec_path is not None
+                    or _webview_sock is not None) and panels:
                 if len(panels) == 2:
                     # Both mode: scale each panel to 50% and place side-by-side
                     h, w = color.shape[:2]
@@ -1116,9 +1459,60 @@ def main():
                         video_writer[0] = cv2.VideoWriter(rec_path, fourcc, 30.0, (fw, fh))
                     video_writer[0].write(out)
 
-                if viz or args.show_mask:
+                # Update shared display buffers (for OpenCV window + MJPEG server)
+                if viz or args.show_mask or args.webview:
+                    _now_t = time.perf_counter()
                     with disp_lock:
                         disp_frame[0] = out
+                        if _now_t - _court_last_t >= 0.10:   # 10 fps cap
+                            court_frame[0] = _render_court_view()
+                            _court_last_t  = _now_t
+
+            # ── UDP state broadcast (viz3d + webview) ─────────────────────────
+            if _udp_sock is not None or _webview_sock is not None:
+                _pkt = {
+                    "t":        time.time(),   # heartbeat — receivers check freshness
+                    "detectors": [lbl for lbl, _ in _detectors],
+                    "cam":      ([round(float(v),4) for v in
+                                  -(_pose["R_cw"].T @ _pose["tvec_flat"])]
+                                 if _pose["R_cw"] is not None else None),
+                    "cam_look": ([round(float(v),4) for v in
+                                  _pose["R_cw"].T @ np.array([0.,0.,1.])]
+                                 if _pose["R_cw"] is not None else None),
+                    "tag_age":  int(_pose["age"]),
+                    "rest":     [round(_rest["x"],2), round(_rest["y"],2), round(_rest["z"],2)],
+                }
+                for _lbl, _ in _detectors:
+                    _se  = _st[_lbl]["ekf"]
+                    _tr  = _st[_lbl]["traj_pts"]
+                    _bn  = []
+                    _lz2 = _tr[0][1][2] if _tr else 1.0
+                    for _, _pp in _tr:
+                        if _lz2 > 0.01 and _pp[2] <= 0.01:
+                            _bn.append([round(float(v),4) for v in _pp])
+                        _lz2 = _pp[2]
+                    _pkt[_lbl] = {
+                        "ball":      ([round(float(v),4) for v in _se.x[:3]]
+                                      if _se.initialized else None),
+                        "vel":       ([round(float(v),4) for v in _se.x[3:]]
+                                      if _se.initialized else None),
+                        "traj":      [[round(float(v),4) for v in p]
+                                      for _, p in _tr[::2]],
+                        "bounces":   _bn,
+                        "ball_hist": list(_hist[_lbl][::3]),
+                    }
+                _pkt_bytes = json.dumps(_pkt).encode()
+                if _udp_sock is not None:
+                    try:
+                        _udp_sock.sendto(_pkt_bytes, ("127.0.0.1", args.viz3d_port))
+                    except Exception:
+                        pass
+                if _webview_sock is not None:
+                    try:
+                        _webview_sock.sendto(
+                            b'\x00' + _pkt_bytes, ("127.0.0.1", args.webview_port))
+                    except Exception:
+                        pass
 
         if video_writer[0] is not None:
             video_writer[0].release()
@@ -1127,8 +1521,26 @@ def main():
     det_thread = threading.Thread(target=detection_worker, daemon=True)
     det_thread.start()
 
+    # ── Save restitution helper (called from main thread) ────────────────────
+    def _save_yaml_main():
+        import re
+        try:
+            with open(args.config) as _f:
+                _txt = _f.read()
+            _txt = re.sub(r"(rest_x:\s*)[\d.]+", f"rest_x: {_rest['x']:.2f}", _txt)
+            _txt = re.sub(r"(rest_y:\s*)[\d.]+", f"rest_y: {_rest['y']:.2f}", _txt)
+            _txt = re.sub(r"(rest_z:\s*)[\d.]+", f"rest_z: {_rest['z']:.2f}", _txt)
+            with open(args.config, "w") as _f:
+                _f.write(_txt)
+            print(f"\n[INFO] Saved rest "
+                  f"({_rest['x']:.2f}/{_rest['y']:.2f}/{_rest['z']:.2f})"
+                  f" → {args.config}")
+        except Exception as _e:
+            print(f"\n[WARN] yaml save failed: {_e}")
+
     # ── Main thread: camera grab + display ───────────────────────────────────
     print(f"[INFO] Running. Press {'q' if viz else 'Ctrl+C'} to quit.")
+    print("[INFO] Keys: q=quit  x/X=rest_x±0.05  y/Y=rest_y±0.05  z/Z=rest_z±0.05  s=save")
     try:
         while True:
             frames = pipeline.wait_for_frames()
@@ -1138,11 +1550,22 @@ def main():
 
             if viz or args.show_mask:
                 with disp_lock:
-                    frame = disp_frame[0]
+                    frame  = disp_frame[0]
+                    cframe = court_frame[0]
                 if frame is not None:
                     cv2.imshow("ball_detection_d455", frame)
-                if cv2.waitKey(1) & 0xFF == ord("q"):
-                    break
+                if cframe is not None:
+                    cv2.imshow("court_view", cframe)
+
+                key = cv2.waitKey(1) & 0xFF
+                if   key == ord("q"): break
+                elif key == ord("x"): _rest["x"] = min(1.5, round(_rest["x"] + 0.05, 2))
+                elif key == ord("X"): _rest["x"] = max(0.0, round(_rest["x"] - 0.05, 2))
+                elif key == ord("y"): _rest["y"] = min(1.5, round(_rest["y"] + 0.05, 2))
+                elif key == ord("Y"): _rest["y"] = max(0.0, round(_rest["y"] - 0.05, 2))
+                elif key == ord("z"): _rest["z"] = min(1.5, round(_rest["z"] + 0.05, 2))
+                elif key == ord("Z"): _rest["z"] = max(0.0, round(_rest["z"] - 0.05, 2))
+                elif key == ord("s"): _save_yaml_main()
     except KeyboardInterrupt:
         print("\n[INFO] Interrupted.")
     finally:
