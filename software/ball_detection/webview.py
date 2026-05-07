@@ -163,11 +163,20 @@ html, body { height:100%; background:#0d0d0d; color:#ddd;
 // ── Detector toggle ───────────────────────────────────────────────────────────
 var currentDet = null, knownDets = [];
 
-function _setDet(det) {
+function _postDet(det) {
+  fetch('/set_det', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({det: det})
+  }).catch(function(){});
+}
+
+function _setDet(det, notify) {
   currentDet = det;
   document.querySelectorAll('.det-btn').forEach(function(b) {
     b.classList.toggle('active', b.dataset.det === det);
   });
+  if (notify !== false) _postDet(det);
 }
 
 function _syncDetBar(dets) {
@@ -182,8 +191,9 @@ function _syncDetBar(dets) {
     btn.addEventListener('click', function() { _setDet(det); });
     bar.appendChild(btn);
   });
-  if (!currentDet || dets.indexOf(currentDet) === -1) _setDet(dets[0]);
-  else _setDet(currentDet);
+  // auto-select: keep current if still valid, else first; always notify ball_detection
+  var sel = (currentDet && dets.indexOf(currentDet) !== -1) ? currentDet : dets[0];
+  _setDet(sel);
 }
 
 // ── Restitution sliders ───────────────────────────────────────────────────────
@@ -356,24 +366,36 @@ class _Handler(BaseHTTPRequestHandler):
             self._send(404, "text/plain", b"not found")
 
     def do_POST(self):
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            body   = self.rfile.read(length)
+            pkt    = json.loads(body)
+        except Exception as e:
+            self._send(400, "application/json",
+                       json.dumps({"error": str(e)}).encode())
+            return
+
         if self.path == "/set_rest":
-            try:
-                length = int(self.headers.get("Content-Length", 0))
-                body   = self.rfile.read(length)
-                pkt    = json.loads(body)
-                rest   = pkt.get("rest")
-                if isinstance(rest, list) and len(rest) == 3:
-                    with _state_lock:
-                        _state["rest"] = [round(float(v), 2) for v in rest]
-                    if _ctrl_sock is not None:
-                        _ctrl_sock.sendto(
-                            json.dumps({"rest": _state["rest"]}).encode(),
-                            _ctrl_addr,
-                        )
-                self._send(200, "application/json", b'{"ok":true}')
-            except Exception as e:
-                self._send(400, "application/json",
-                           json.dumps({"error": str(e)}).encode())
+            rest = pkt.get("rest")
+            if isinstance(rest, list) and len(rest) == 3:
+                with _state_lock:
+                    _state["rest"] = [round(float(v), 2) for v in rest]
+                if _ctrl_sock is not None:
+                    _ctrl_sock.sendto(
+                        json.dumps({"rest": _state["rest"]}).encode(),
+                        _ctrl_addr,
+                    )
+            self._send(200, "application/json", b'{"ok":true}')
+
+        elif self.path == "/set_det":
+            det = pkt.get("det") or None   # None / "" → composite (both)
+            if _ctrl_sock is not None:
+                _ctrl_sock.sendto(
+                    json.dumps({"det": det}).encode(),
+                    _ctrl_addr,
+                )
+            self._send(200, "application/json", b'{"ok":true}')
+
         else:
             self._send(404, "text/plain", b"not found")
 

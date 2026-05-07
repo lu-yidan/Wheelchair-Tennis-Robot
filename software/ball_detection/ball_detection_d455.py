@@ -668,7 +668,14 @@ def main():
         print(f"[INFO] viz3d UDP → localhost:{args.viz3d_port}  "
               f"(open http://localhost:5001 after starting viz3d.py)")
 
-        # Control listener — receives rest updates from viz3d.py web sliders
+    _webview_sock = None
+    if args.webview:
+        _webview_sock = _socket_mod.socket(_socket_mod.AF_INET, _socket_mod.SOCK_DGRAM)
+        print(f"[INFO] webview UDP → localhost:{args.webview_port}  "
+              f"(open http://localhost:5002 after starting webview.py)")
+
+    # Control listener — receives rest / det updates from viz3d.py and webview.py
+    if args.viz3d or args.webview:
         def _ctrl_listener():
             sock = _socket_mod.socket(_socket_mod.AF_INET, _socket_mod.SOCK_DGRAM)
             sock.bind(("127.0.0.1", args.ctrl_port))
@@ -681,19 +688,16 @@ def main():
                         _rest["x"] = round(float(pkt["rest"][0]), 2)
                         _rest["y"] = round(float(pkt["rest"][1]), 2)
                         _rest["z"] = round(float(pkt["rest"][2]), 2)
+                    if "det" in pkt:
+                        _disp_det[0] = pkt["det"] or None
                 except _socket_mod.timeout:
                     pass
                 except Exception:
                     pass
 
         threading.Thread(target=_ctrl_listener, daemon=True).start()
-        print(f"[INFO] viz3d control listener on localhost:{args.ctrl_port}")
-
-    _webview_sock = None
-    if args.webview:
-        _webview_sock = _socket_mod.socket(_socket_mod.AF_INET, _socket_mod.SOCK_DGRAM)
-        print(f"[INFO] webview UDP → localhost:{args.webview_port}  "
-              f"(open http://localhost:5002 after starting webview.py)")
+        print(f"[INFO] ctrl listener on localhost:{args.ctrl_port}  "
+              f"(rest + detector selection from web sliders)")
 
     rec_path = None
     if args.record is not None:
@@ -803,6 +807,7 @@ def main():
     disp_lock   = threading.Lock()
     disp_frame  = [None]
     court_frame = [None]
+    _disp_det   = [None]   # which detector label to show in MJPEG (None = composite)
 
     # ── Internal full-resolution MJPEG server ─────────────────────────────────
     if args.webview and getattr(args, "mjpeg_port", 0) > 0:
@@ -1462,8 +1467,14 @@ def main():
                 # Update shared display buffers (for OpenCV window + MJPEG server)
                 if viz or args.show_mask or args.webview:
                     _now_t = time.perf_counter()
+                    # Build label→panel map for detector selection
+                    _panel_map = {lbl: panels[i]
+                                  for i, (lbl, _) in enumerate(_detectors)
+                                  if i < len(panels)}
+                    _sel = _disp_det[0]
+                    _mjpeg_frame = _panel_map.get(_sel, out)
                     with disp_lock:
-                        disp_frame[0] = out
+                        disp_frame[0] = _mjpeg_frame
                         if _now_t - _court_last_t >= 0.10:   # 10 fps cap
                             court_frame[0] = _render_court_view()
                             _court_last_t  = _now_t
