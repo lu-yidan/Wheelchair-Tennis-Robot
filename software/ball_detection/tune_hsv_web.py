@@ -29,7 +29,8 @@ import pyrealsense2 as rs
 
 # ── defaults (match d455.yaml) ────────────────────────────────────────────────
 DEF = dict(h_low=25, h_high=80, s_min=80, v_min=80,
-           mog2_thr=50, min_r=3, circ=55)   # circ is circularity × 100
+           mog2_thr=50, min_r=3, circ=55,   # circ is circularity × 100
+           motion=True)                      # MOG2 on/off toggle
 
 BALL_RADIUS = 0.0335  # m
 
@@ -50,7 +51,11 @@ def _get():
 
 def _set(key, raw):
     with _p_lock:
-        if key in _params:
+        if key not in _params:
+            return
+        if isinstance(_params[key], bool):
+            _params[key] = raw in ('1', 'true', 'True', 'yes')
+        else:
             try:
                 _params[key] = int(raw)
             except ValueError:
@@ -78,6 +83,8 @@ def _html():
         <span id="{k}v">{p[k]}</span>
       </div>''' for k, label, mn, mx in rows)
 
+    motion_checked = 'checked' if p['motion'] else ''
+
     return f'''<!DOCTYPE html>
 <html lang="zh">
 <head>
@@ -91,7 +98,7 @@ def _html():
   .ctrl{{width:320px;flex-shrink:0}}
   .row{{display:flex;align-items:center;gap:8px;margin-bottom:10px}}
   .row label{{width:140px;color:#999}}
-  .row input{{flex:1;accent-color:#4af}}
+  .row input[type=range]{{flex:1;accent-color:#4af}}
   .row span{{width:34px;text-align:right;color:#4af;font-weight:bold}}
   .img-wrap img{{max-width:100%;border:1px solid #333;display:block}}
   pre{{background:#0a0a0a;border:1px solid #333;padding:10px;border-radius:4px;
@@ -100,6 +107,22 @@ def _html():
           border:1px solid #444;border-radius:3px;cursor:pointer;font-family:monospace}}
   button:hover{{background:#3a3a3a}}
   .note{{color:#666;font-size:11px;margin-top:6px}}
+  .divider{{border:none;border-top:1px solid #2a2a2a;margin:12px 0}}
+  /* toggle switch */
+  .toggle-row{{display:flex;align-items:center;gap:12px;margin-bottom:12px}}
+  .toggle-row .tlabel{{color:#ccc;font-size:13px}}
+  .switch{{position:relative;display:inline-block;width:46px;height:24px}}
+  .switch input{{opacity:0;width:0;height:0}}
+  .slider-sw{{position:absolute;cursor:pointer;inset:0;background:#333;
+              border-radius:24px;transition:.2s}}
+  .slider-sw:before{{position:absolute;content:"";height:18px;width:18px;
+                     left:3px;bottom:3px;background:#888;border-radius:50%;
+                     transition:.2s}}
+  input:checked+.slider-sw{{background:#2a6}}
+  input:checked+.slider-sw:before{{transform:translateX(22px);background:#fff}}
+  .badge{{font-size:11px;padding:2px 7px;border-radius:10px;font-weight:bold}}
+  .badge.on{{background:#2a6;color:#fff}}
+  .badge.off{{background:#444;color:#888}}
 </style>
 </head>
 <body>
@@ -107,6 +130,23 @@ def _html():
 <div class="layout">
   <div class="ctrl">
 {sliders}
+    <hr class="divider">
+    <div class="toggle-row">
+      <label class="switch">
+        <input type="checkbox" id="motion" {motion_checked}
+               onchange="toggleMotion(this)">
+        <span class="slider-sw"></span>
+      </label>
+      <span class="tlabel">MOG2 运动滤波</span>
+      <span class="badge {'on' if p['motion'] else 'off'}" id="motion_badge">
+        {'ON' if p['motion'] else 'OFF'}
+      </span>
+    </div>
+    <p class="note" style="margin-bottom:12px">
+      开启：HSV ∩ MOG2（减少静止背景误检）<br>
+      关闭：纯 HSV（Panel 3 仍显示 MOG2 供参考）
+    </p>
+    <hr class="divider">
     <button onclick="copy()">复制 YAML 配置</button>
     <p class="note">粘贴到 config/d455.yaml 即可保存</p>
     <pre id="out">—</pre>
@@ -121,15 +161,25 @@ function upd(el){{
   fetch('/set?'+el.id+'='+el.value);
   refresh();
 }}
+function toggleMotion(el){{
+  var on = el.checked;
+  fetch('/set?motion='+(on?'1':'0'));
+  var badge = document.getElementById('motion_badge');
+  badge.textContent = on ? 'ON' : 'OFF';
+  badge.className = 'badge '+(on?'on':'off');
+  refresh();
+}}
 function v(id){{return document.getElementById(id).value;}}
+function motionOn(){{return document.getElementById('motion').checked;}}
 function refresh(){{
   document.getElementById('out').textContent =
     '# 粘贴到 config/d455.yaml\\n'+
     'h_low:  '+v('h_low')+'\\n'+
     'h_high: '+v('h_high')+'\\n'+
     's_min:  '+v('s_min')+'\\n'+
-    'v_min:  '+v('v_min')+'\\n\\n'+
-    '# tune_hsv_web 专用参数（不在 d455.yaml 里）\\n'+
+    'v_min:  '+v('v_min')+'\\n'+
+    'motion: '+(motionOn()?'true':'false')+'\\n\\n'+
+    '# tune_hsv_web 专用参数（d455.yaml 里无对应项）\\n'+
     '# mog2_threshold: '+v('mog2_thr')+'\\n'+
     '# min_radius_px:  '+v('min_r')+'\\n'+
     '# circularity:    '+(v('circ')/100).toFixed(2);
@@ -272,12 +322,13 @@ def main():
                 continue
 
             # ── Read params (snapshot, thread-safe) ───────────────────────────
-            p      = _get()
-            h_low  = p['h_low'];   h_high = p['h_high']
-            s_min  = p['s_min'];   v_min  = p['v_min']
-            mog2_t = p['mog2_thr']
-            min_r  = max(p['min_r'], 1)
-            circ   = p['circ'] / 100.0
+            p         = _get()
+            h_low     = p['h_low'];   h_high = p['h_high']
+            s_min     = p['s_min'];   v_min  = p['v_min']
+            mog2_t    = p['mog2_thr']
+            min_r     = max(p['min_r'], 1)
+            circ      = p['circ'] / 100.0
+            use_motion = p['motion']
 
             color     = np.asanyarray(cf.get_data()).copy()
             depth_arr = np.asanyarray(df.get_data())
@@ -308,7 +359,9 @@ def main():
             motion_mask = cv2.morphologyEx(motion_mask, cv2.MORPH_DILATE, kern5, iterations=2)
 
             # ── Combined mask ─────────────────────────────────────────────────
-            combined = cv2.bitwise_and(hsv_mask, motion_mask)
+            # combined: HSV ∩ MOG2 when motion filter is ON, pure HSV otherwise.
+            # MOG2 mask is always computed so Panel 3 remains informative.
+            combined = cv2.bitwise_and(hsv_mask, motion_mask) if use_motion else hsv_mask
 
             # ── Detect candidates ─────────────────────────────────────────────
             contours, _ = cv2.findContours(combined, cv2.RETR_EXTERNAL,
@@ -370,18 +423,26 @@ def main():
                         f"2 HSV mask  H=[{h_low},{h_high}] S>={s_min} V>={v_min}",
                         (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
+            # Panel 3: MOG2 mask — always shown even when filter is OFF
             mot_disp = cv2.cvtColor(motion_mask, cv2.COLOR_GRAY2BGR)
             mot_disp[motion_mask > 0] = [200, 80, 0]
-            cv2.putText(mot_disp, f"3 MOG2 motion  thr={mog2_t}",
+            mot_label = f"3 MOG2 motion  thr={mog2_t}"
+            if not use_motion:
+                mot_label += "  [NOT APPLIED]"
+                cv2.rectangle(mot_disp, (0, 0), (mot_disp.shape[1], mot_disp.shape[0]),
+                              (0, 0, 80), 6)   # red border = disabled
+            cv2.putText(mot_disp, mot_label,
                         (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
+            # Panel 4: combined result
             comb_disp = cv2.cvtColor(combined, cv2.COLOR_GRAY2BGR)
             comb_disp[combined > 0] = [0, 200, 80]
             if best is not None:
                 _, bx, by, br, _ = best
                 cv2.circle(comb_disp, (bx, by), int(br), (0, 255, 0), 2)
+            comb_mode = "HSV+MOG2" if use_motion else "HSV only"
             cv2.putText(comb_disp,
-                        f"4 Combined  cands={len(contours)}  passing={n_pass}",
+                        f"4 {comb_mode}  cands={len(contours)}  passing={n_pass}",
                         (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
             # ── Tile 2×2 and encode as JPEG ───────────────────────────────────
