@@ -1186,7 +1186,7 @@ def main():
             return detected, coasting, pos_ekf, depth_fused
 
         # ── Annotation closure (per-panel) ────────────────────────────────────
-        def _annotate(frame, st, mask, label, detected, coasting, pos_ekf, depth_fused):
+        def _annotate(frame, st, mask, label, detected, coasting, pos_ekf, depth_fused, hist=None):
             vis  = frame.copy()
             cx, cy, r, miss = st["cx"], st["cy"], st["r"], st["miss"]
 
@@ -1249,6 +1249,24 @@ def main():
                 cv2.putText(vis, "No ball",
                             (20, vis.shape[0] // 2),
                             cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 2)
+
+            # Historical trail — past 3-D positions projected onto image
+            if hist and _world_active():
+                n = len(hist)
+                prev_px = None
+                for i, h_pt in enumerate(hist):
+                    t = i / max(n - 1, 1)          # 0 = oldest, 1 = newest
+                    pt_body = _to_body(h_pt)
+                    px = _body_to_pixel(pt_body, color_intrin)
+                    if px is None:
+                        prev_px = None
+                        continue
+                    # BGR fade: dark orange → bright orange
+                    col = (0, int(30 + 135 * t), int(80 + 175 * t))
+                    cv2.circle(vis, px, max(2, int(2 + 2 * t)), col, -1)
+                    if prev_px is not None:
+                        cv2.line(vis, prev_px, px, col, 1)
+                    prev_px = px
 
             # Trajectory overlay (use pre-computed rollout from st["traj_pts"])
             traj_pts = st["traj_pts"]
@@ -1404,7 +1422,8 @@ def main():
                 if viz or args.show_mask or rec_path is not None:
                     panels.append(
                         _annotate(color, st, mask, label,
-                                  detected, coasting, pos_ekf, depth_fused))
+                                  detected, coasting, pos_ekf, depth_fused,
+                                  _hist[label]))
 
             print(f"\r{'  ||  '.join(term_parts)}", end="", flush=True)
 
