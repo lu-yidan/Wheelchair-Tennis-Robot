@@ -624,6 +624,9 @@ def main():
                         help="UDP port for state stream to webview.py (default 5567)")
     parser.add_argument("--mjpeg-port",   type=int, default=5568,
                         help="port for internal full-res MJPEG server (default 5568, 0=disable)")
+    parser.add_argument("--save-traj",    type=str, default="",
+                        help="save EKF trajectory to JSON for rest calibration "
+                             "(e.g. --save-traj traj.json)")
     parser.set_defaults(**_cfg)   # config file values override code defaults
     args = parser.parse_args()    # CLI args override everything
 
@@ -808,6 +811,10 @@ def main():
     disp_frame  = [None]
     court_frame = [None]
     _disp_det   = [None]   # which detector label to show in MJPEG (None = composite)
+
+    # Trajectory log for rest-coefficient calibration (--save-traj)
+    _traj_log    = []       # list of frame dicts; appended by detection_worker
+    _traj_prev_z = [None]  # previous frame's Z for bounce detection
 
     # ── Internal full-resolution MJPEG server ─────────────────────────────────
     if args.webview and getattr(args, "mjpeg_port", 0) > 0:
@@ -1449,6 +1456,22 @@ def main():
                 _court["traj"].clear()
                 _court["bounces"].clear()
 
+            # Trajectory log for calibrate_rest.py (--save-traj)
+            if args.save_traj and _world_active():
+                _se0 = _st[_detectors[0][0]]["ekf"]
+                if _se0.initialized:
+                    _pos_w = [round(float(v), 4) for v in _se0.x[:3]]
+                    _vel_w = [round(float(v), 4) for v in _se0.x[3:]]
+                    _pz    = _traj_prev_z[0]
+                    _bounce = (_pz is not None and _pz > 0.06 and _pos_w[2] <= 0.06)
+                    _traj_prev_z[0] = _pos_w[2]
+                    _traj_log.append({
+                        "t":      round(time.time(), 4),
+                        "pos":    _pos_w,
+                        "vel":    _vel_w,
+                        "bounce": _bounce,
+                    })
+
             # Per-detector ball history (for UDP multi-detector selector)
             for _lbl, _ in _detectors:
                 _se = _st[_lbl]["ekf"]
@@ -1604,6 +1627,21 @@ def main():
         pipeline.stop()
         if viz or args.show_mask:
             cv2.destroyAllWindows()
+
+        if args.save_traj and _traj_log:
+            _n_bounces = sum(1 for f in _traj_log if f["bounce"])
+            _meta = {
+                "coeff_drag": args.coeff_drag,
+                "detector":   args.detector,
+                "n_frames":   len(_traj_log),
+                "n_bounces":  _n_bounces,
+            }
+            with open(args.save_traj, "w") as _f:
+                json.dump({"meta": _meta, "frames": _traj_log},
+                          _f, separators=(",", ":"))
+            print(f"[INFO] Trajectory saved → {args.save_traj}  "
+                  f"({len(_traj_log)} frames, {_n_bounces} bounces detected)")
+
         print("\n[INFO] Done.")
 
 
