@@ -126,6 +126,15 @@ motion: false   # true = HSV ∩ MOG2 (reduces static false positives)
                 # false = pure HSV (better for moving camera / complex background)
 ```
 
+### HSV detection thresholds
+```yaml
+mog2_threshold: 50    # MOG2 varThreshold — higher = less sensitive to background changes
+min_radius_px:  3     # smallest ball radius accepted (px); raise to ignore small noise
+circularity:    0.55  # minimum roundness 0–1; tennis ball typically 0.55–0.80
+```
+These are the same parameters exposed as sliders in `tune_hsv_web.py`.
+Copy the tuned values directly from the "Copy YAML" button output.
+
 ### YOLO (when detector: yolo or both)
 ```yaml
 yolo_model: models/yolov8n.pt

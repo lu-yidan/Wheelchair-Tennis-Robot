@@ -325,7 +325,8 @@ class PhysicsEKF:
 #  Detection
 # ══════════════════════════════════════════════════════════════════════════════
 
-def detect_tennis_ball(frame_bgr, hsv_low, hsv_high, back_sub=None):
+def detect_tennis_ball(frame_bgr, hsv_low, hsv_high, back_sub=None,
+                       min_r=MIN_RADIUS_PX, min_circ=MIN_CIRCULARITY):
     """
     Detect tennis ball in a BGR frame.
 
@@ -364,16 +365,16 @@ def detect_tennis_ball(frame_bgr, hsv_low, hsv_high, back_sub=None):
     best = None   # (score, cx, cy, r)
     for cnt in contours:
         area = cv2.contourArea(cnt)
-        if area < np.pi * MIN_RADIUS_PX**2:
+        if area < np.pi * min_r**2:
             continue
         peri = cv2.arcLength(cnt, True)
         if peri == 0:
             continue
         circ = 4 * np.pi * area / (peri**2)
-        if circ < MIN_CIRCULARITY:
+        if circ < min_circ:
             continue
         (cx_f, cy_f), r = cv2.minEnclosingCircle(cnt)
-        if not (MIN_RADIUS_PX <= r <= MAX_RADIUS_PX):
+        if not (min_r <= r <= MAX_RADIUS_PX):
             continue
         score = area * circ
         if best is None or score > best[0]:
@@ -503,6 +504,11 @@ def _load_config(path):
     _get("tag_id",      int,   "tag_id")
     _get("tag_size_m",  float, "tag_size_m")
 
+    # HSV detection thresholds
+    _get("mog2_threshold", int,   "mog2_threshold")
+    _get("min_radius_px",  int,   "min_radius")
+    _get("circularity",    float, "circularity")
+
     # Visualisation — YAML positive, argparse negated
     if "viz" in cfg:
         out["no_viz"] = not bool(cfg["viz"])
@@ -574,8 +580,14 @@ def main():
     parser.add_argument("--tag-size-m",   type=float, default=0.0,
                         help="Physical tag size — black-square outer edge in metres; "
                              "0 = disable tag-based calibration")
-    parser.add_argument("--no-tag",       action="store_true",
+    parser.add_argument("--no-tag",          action="store_true",
                         help="disable per-frame AprilTag ground calibration")
+    parser.add_argument("--mog2-threshold", type=int,   default=50,
+                        help="MOG2 varThreshold (higher = less sensitive, default 50)")
+    parser.add_argument("--min-radius",     type=int,   default=MIN_RADIUS_PX,
+                        help="minimum ball radius in pixels (default 3)")
+    parser.add_argument("--circularity",    type=float, default=MIN_CIRCULARITY,
+                        help="minimum contour circularity 0–1 (default 0.55)")
     parser.set_defaults(**_cfg)   # config file values override code defaults
     args = parser.parse_args()    # CLI args override everything
 
@@ -699,8 +711,8 @@ def main():
     t_cd = c2d_extr.translation
     print(f"[INFO] Color→Depth  tx={t_cd[0]*1000:.1f}mm "
           f"ty={t_cd[1]*1000:.1f}mm tz={t_cd[2]*1000:.1f}mm")
-    print(f"[INFO] Max visual range ≈ {fx * BALL_RADIUS / MIN_RADIUS_PX:.1f} m "
-          f"(fx={fx:.0f}, R={BALL_RADIUS}m, min_r={MIN_RADIUS_PX}px)")
+    print(f"[INFO] Max visual range ≈ {fx * BALL_RADIUS / args.min_radius:.1f} m "
+          f"(fx={fx:.0f}, R={BALL_RADIUS}m, min_r={args.min_radius}px)")
 
     # ── Shared state ──────────────────────────────────────────────────────────
     buf_lock    = threading.Lock()
@@ -764,10 +776,13 @@ def main():
         _hsv_fn = None
         if args.detector in ("hsv", "both"):
             _back_sub = (None if args.no_motion else
-                         cv2.createBackgroundSubtractorMOG2(history=100, varThreshold=50,
-                                                            detectShadows=False))
+                         cv2.createBackgroundSubtractorMOG2(
+                             history=100, varThreshold=args.mog2_threshold,
+                             detectShadows=False))
             def _hsv_fn(frame):
-                return detect_tennis_ball(frame, hsv_low, hsv_high, _back_sub)
+                return detect_tennis_ball(frame, hsv_low, hsv_high, _back_sub,
+                                          min_r=args.min_radius,
+                                          min_circ=args.circularity)
 
         # Active detector list: order = [YOLO, HSV] for "both"
         _detectors = []   # list of (label, detect_fn)
