@@ -95,7 +95,7 @@ def _parse_segments(s: str) -> list:
     return segs
 
 
-def _load(path: str, segments: list | None):
+def _load(path: str, segments=None):
     with open(path) as f:
         data = json.load(f)
 
