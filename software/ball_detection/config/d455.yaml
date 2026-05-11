@@ -73,7 +73,8 @@ traj:      true    # 显示预测弹道（红线 + 弹跳点青色圆点）
 # true            — 自动保存到 recordings/ball_YYYYMMDD_HHMMSS.mp4
 # "recordings/"   — 同上（目录路径，自动生成文件名）
 # "output.mp4"    — 指定完整文件名
-record: false
+record: true
+record_raw: false    # true = 录制原始无叠层画面；false = 录制标注后画面（含轨迹/球圈等）
 
 # ── 轨迹录制（用于 calibrate_web.py 标定恢复系数）──────────────────────────────
 # false          — 不录制

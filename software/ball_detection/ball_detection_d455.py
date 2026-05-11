@@ -550,6 +550,9 @@ def _load_config(path):
     _get("webview_port", int, "webview_port")
     _get("mjpeg_port",   int, "mjpeg_port")
 
+    if "record_raw" in cfg:
+        out["record_raw"] = bool(cfg["record_raw"])
+
     # Trajectory recording: false→"", true→"logs/", "path.json"→"path.json"
     if "save_traj" in cfg:
         st = cfg["save_traj"]
@@ -603,6 +606,8 @@ def main():
     parser.add_argument("--conf",         type=float, default=0.3, help="YOLO confidence threshold")
     parser.add_argument("--record",       metavar="FILE", nargs="?", const="",
                         help="record annotated video; omit FILE for auto timestamp name")
+    parser.add_argument("--record-raw",   action="store_true",
+                        help="record raw (unannotated) colour frame instead of annotated output")
     parser.add_argument("--camera-height", type=float, default=0.0,
                         help="camera centre height above ground (m); cold-start value when tag not yet visible")
     parser.add_argument("--camera-pitch",  type=float, default=0.0,
@@ -1519,11 +1524,12 @@ def main():
                     out = panels[0]
 
                 if rec_path is not None:
+                    _rec_frame = color if getattr(args, "record_raw", False) else out
                     if video_writer[0] is None:
-                        fh, fw = out.shape[:2]
+                        fh, fw = _rec_frame.shape[:2]
                         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
                         video_writer[0] = cv2.VideoWriter(rec_path, fourcc, 30.0, (fw, fh))
-                    video_writer[0].write(out)
+                    video_writer[0].write(_rec_frame)
 
                 # Update shared display buffers (for OpenCV window + MJPEG server)
                 if viz or args.show_mask or args.webview:
