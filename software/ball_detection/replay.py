@@ -78,10 +78,24 @@ def _load_intrinsics(video_path, config_path):
 
 def _build_aruco(tag_family):
     """Return (detector_or_None, dict, params) for the detected OpenCV version."""
-    fam_key = f"DICT_{tag_family.upper().replace('-', '_')}"
-    fam_id  = getattr(cv2.aruco, fam_key, None)
+    # "tag36h11" → DICT_APRILTAG_36h11  (strip leading "tag" prefix)
+    fam  = tag_family.lower().replace("-", "_")
+    bare = fam[3:] if fam.startswith("tag") else fam   # "36h11"
+    candidates = [
+        f"DICT_APRILTAG_{bare.upper()}",   # DICT_APRILTAG_36H11
+        f"DICT_APRILTAG_{bare}",           # DICT_APRILTAG_36h11
+        f"DICT_{fam.upper()}",             # DICT_TAG36H11
+        f"DICT_{fam}",                     # DICT_tag36h11
+    ]
+    fam_id = None
+    for name in candidates:
+        fam_id = getattr(cv2.aruco, name, None)
+        if fam_id is not None:
+            break
     if fam_id is None:
-        raise ValueError(f"Unknown ArUco family: {tag_family}")
+        raise ValueError(
+            f"Unknown ArUco family '{tag_family}'. "
+            f"Tried: {candidates}")
     try:
         d   = cv2.aruco.getPredefinedDictionary(fam_id)
         p   = cv2.aruco.DetectorParameters()
