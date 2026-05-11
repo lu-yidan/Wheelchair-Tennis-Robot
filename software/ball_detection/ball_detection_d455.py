@@ -39,7 +39,12 @@ import threading
 import time
 import numpy as np
 import cv2
-import pyrealsense2 as rs
+try:
+    import pyrealsense2 as rs
+    _HAS_RS = True
+except ImportError:
+    rs = None          # replay.py and calibrate scripts import from here without hardware
+    _HAS_RS = False
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -825,6 +830,25 @@ def main():
           f"ty={t_cd[1]*1000:.1f}mm tz={t_cd[2]*1000:.1f}mm")
     print(f"[INFO] Max visual range ≈ {fx * BALL_RADIUS / args.min_radius:.1f} m "
           f"(fx={fx:.0f}, R={BALL_RADIUS}m, min_r={args.min_radius}px)")
+
+    # Save camera intrinsics sidecar alongside raw recordings for offline replay
+    if rec_path and getattr(args, "record_raw", False):
+        _intr_path = os.path.splitext(rec_path)[0] + "_intrinsics.json"
+        with open(_intr_path, "w") as _f:
+            json.dump({
+                "fx": color_intrin.fx, "fy": color_intrin.fy,
+                "ppx": color_intrin.ppx, "ppy": color_intrin.ppy,
+                "width": color_intrin.width, "height": color_intrin.height,
+                "dist": list(color_intrin.coeffs[:5]),
+                "tag_family": args.tag_family, "tag_ids": list(args.tag_ids),
+                "tag_size_m": tag_size_m,
+                "coeff_drag": args.coeff_drag,
+                "rest_x": args.rest_x, "rest_y": args.rest_y, "rest_z": args.rest_z,
+                "h_low": args.h_low, "h_high": args.h_high,
+                "s_min": args.s_min, "v_min": args.v_min,
+                "min_radius_px": args.min_radius, "circularity": args.circularity,
+            }, _f, indent=2)
+        print(f"[INFO] Intrinsics saved → {_intr_path}  (load with replay.py)")
 
     # ── Shared state ──────────────────────────────────────────────────────────
     buf_lock    = threading.Lock()
