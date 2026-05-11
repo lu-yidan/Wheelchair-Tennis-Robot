@@ -209,6 +209,37 @@ def _objective(rest: np.ndarray, events: list, dk: float) -> float:
     return total_sq / max(n_pts, 1)
 
 
+# ── Height-ratio rest_z + fixed-z XY objective ───────────────────────────────
+
+def _fit_rest_z(events: list) -> tuple:
+    """
+    Estimate rest_z from peak-height ratios of consecutive bounces.
+
+    For two successive bounces:  h2/h1 = rest_z²  →  rest_z = √(h2/h1)
+
+    This bypasses EKF velocity noise entirely.
+    Returns (median_rest_z, [individual_estimates]).
+    """
+    heights = [max([p[2] for p in ev["pos_post"]]) if ev["pos_post"] else 0.0
+               for ev in events]
+    ratios = []
+    for i in range(len(events) - 1):
+        h1, h2 = heights[i], heights[i + 1]
+        dt = events[i + 1]["t_bounce"] - events[i]["t_bounce"]
+        # Only pair truly consecutive bounces (dt < 3 s, both have enough height)
+        if h1 > 0.05 and h2 > 0.02 and dt < 3.0:
+            ratios.append(float(np.sqrt(h2 / h1)))
+    if not ratios:
+        return 0.71, []
+    return float(np.median(ratios)), [round(r, 4) for r in ratios]
+
+
+def _objective_xy(rest_xy: np.ndarray, events: list, dk: float,
+                  rest_z: float) -> float:
+    """2-D objective: optimise only rest_x/y with rest_z held fixed."""
+    return _objective(np.array([rest_xy[0], rest_xy[1], rest_z]), events, dk)
+
+
 # ── Plots ─────────────────────────────────────────────────────────────────────
 
 def _plot_overview(frames: list, events: list):
@@ -347,26 +378,37 @@ def main():
                 pass
         sys.exit(1)
 
-    print(f"\n[calibrate] Optimising over {len(events)} bounce events …  "
-          f"(may take 15–40 s)")
+    # ── Stage 1: rest_z from peak-height ratios ───────────────────────────────
+    rz, rz_pairs = _fit_rest_z(events)
+    if rz_pairs:
+        print(f"\n[calibrate] rest_z    : {rz:.4f}  "
+              f"(median of {len(rz_pairs)} consecutive-bounce height-ratio pairs: "
+              + ", ".join(f"{r:.3f}" for r in rz_pairs) + ")")
+    else:
+        print(f"\n[calibrate] rest_z    : {rz:.4f}  "
+              "(fallback — no consecutive bounce pairs found; "
+              "select more bounces or re-record)")
 
-    bounds = [(0.05, 1.50)] * 3
+    # ── Stage 2: optimise rest_x / rest_y with rest_z fixed ──────────────────
+    print(f"[calibrate] Optimising rest_x/y  (rest_z={rz:.4f} fixed) "
+          f"over {len(events)} events …  (may take 5–20 s)")
+
     result = differential_evolution(
-        _objective, bounds,
-        args=(events, dk),
+        _objective_xy, [(0.05, 1.50)] * 2,
+        args=(events, dk, rz),
         seed=42, tol=1e-5, maxiter=1000,
         popsize=15, mutation=(0.5, 1.2), recombination=0.8,
         disp=False,
     )
 
-    rx, ry, rz = result.x
-    rmse_cm = np.sqrt(result.fun) * 100.0   # convert m → cm
+    rx, ry = result.x
+    rmse_cm = np.sqrt(_objective(np.array([rx, ry, rz]), events, dk)) * 100.0
 
     print()
     print("─" * 46)
     print(f"  rest_x : {rx:.4f}")
     print(f"  rest_y : {ry:.4f}")
-    print(f"  rest_z : {rz:.4f}")
+    print(f"  rest_z : {rz:.4f}  ← height-ratio method")
     print(f"  RMSE   : {rmse_cm:.1f} cm  (position error, post-bounce)")
     print(f"  bounces: {len(events)}")
     print("─" * 46)
@@ -378,7 +420,7 @@ def main():
 
     if args.plot:
         try:
-            _plot_bounces(events, result.x, dk)
+            _plot_bounces(events, np.array([rx, ry, rz]), dk)
             import matplotlib.pyplot as plt
             plt.show()
         except ImportError:

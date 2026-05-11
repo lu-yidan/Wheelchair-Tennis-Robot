@@ -30,7 +30,8 @@ import numpy as np
 
 # ── Import shared physics/data functions from calibrate_rest.py ───────────────
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from calibrate_rest import _drag_k, _extract_bounces, _objective, _simulate, _load
+from calibrate_rest import (_drag_k, _extract_bounces, _objective,
+                            _objective_xy, _fit_rest_z, _simulate, _load)
 
 # ── Global state (set once in main, read-only after) ─────────────────────────
 _frames  = []
@@ -156,7 +157,11 @@ h1  { font-size:15px; color:#aef; margin-bottom:5px; }
     <div class="rest-row">
       <div class="rest-item"><div class="lbl">rest_x</div><div class="val" id="r_x">—</div></div>
       <div class="rest-item"><div class="lbl">rest_y</div><div class="val" id="r_y">—</div></div>
-      <div class="rest-item"><div class="lbl">rest_z</div><div class="val" id="r_z">—</div></div>
+      <div class="rest-item">
+        <div class="lbl">rest_z</div>
+        <div class="val" id="r_z">—</div>
+        <div class="sub" id="r_z_note"></div>
+      </div>
       <div class="rest-item rmse-item" style="margin-left:auto">
         <div class="lbl">RMSE</div>
         <div class="val" id="r_rmse">—</div>
@@ -382,6 +387,17 @@ function _showResults(r) {
   document.getElementById('r_rmse').textContent = r.rmse_cm.toFixed(1) + ' cm';
   document.getElementById('r_nb').textContent   = r.n_bounces + ' bounces';
 
+  var pairs = r.rz_pairs || [];
+  var noteEl = document.getElementById('r_z_note');
+  if (pairs.length) {
+    noteEl.textContent = '√(h₂/h₁) × ' + pairs.length +
+      ' pairs: ' + pairs.join(', ');
+    noteEl.style.color = '#5b5';
+  } else {
+    noteEl.textContent = 'fallback — no consecutive pairs';
+    noteEl.style.color = '#a63';
+  }
+
   var yaml =
     'rest_x: ' + r.rest_x.toFixed(2) + '\\n' +
     'rest_y: ' + r.rest_y.toFixed(2) + '\\n' +
@@ -532,16 +548,22 @@ def _run_opt(indices):
                              "result": {"error": "No bounce events selected"}})
             return
 
+        # Stage 1: rest_z from peak-height ratios — independent of EKF velocity
+        rz, rz_pairs = _fit_rest_z(events)
+
+        # Stage 2: optimise rest_x / rest_y with rest_z held fixed
         res = differential_evolution(
-            _objective, [(0.05, 1.50)] * 3,
-            args=(events, dk),
+            _objective_xy, [(0.05, 1.50)] * 2,
+            args=(events, dk, rz),
             seed=42, tol=1e-5, maxiter=1000,
             popsize=15, mutation=(0.5, 1.2), recombination=0.8,
             disp=False,
         )
 
-        rx, ry, rz = res.x
-        rmse_cm = float(np.sqrt(res.fun)) * 100.0
+        rx, ry = res.x
+        rmse_cm = float(np.sqrt(
+            _objective(np.array([rx, ry, rz]), events, dk)
+        )) * 100.0
 
         fits = []
         for idx, ev in zip(sorted(set(indices)), events):
@@ -566,6 +588,7 @@ def _run_opt(indices):
                     "rest_x":    round(float(rx), 4),
                     "rest_y":    round(float(ry), 4),
                     "rest_z":    round(float(rz), 4),
+                    "rz_pairs":  rz_pairs,
                     "rmse_cm":   round(rmse_cm, 2),
                     "n_bounces": len(events),
                     "fits":      fits,
