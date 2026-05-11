@@ -625,8 +625,9 @@ def main():
     parser.add_argument("--mjpeg-port",   type=int, default=5568,
                         help="port for internal full-res MJPEG server (default 5568, 0=disable)")
     parser.add_argument("--save-traj",    type=str, default="",
-                        help="save EKF trajectory to JSON for rest calibration "
-                             "(e.g. --save-traj traj.json)")
+                        help="save EKF trajectory to JSON for rest calibration. "
+                             "Pass a directory to auto-name: --save-traj logs/ "
+                             "→ logs/traj_YYYYMMDD_HHMMSS.json")
     parser.set_defaults(**_cfg)   # config file values override code defaults
     args = parser.parse_args()    # CLI args override everything
 
@@ -1629,17 +1630,28 @@ def main():
             cv2.destroyAllWindows()
 
         if args.save_traj and _traj_log:
+            import datetime as _dt
             _n_bounces = sum(1 for f in _traj_log if f["bounce"])
+            # If path is a directory (or ends with /), auto-generate filename
+            _sp = args.save_traj
+            if _sp.endswith("/") or _sp.endswith(os.sep) or os.path.isdir(_sp):
+                os.makedirs(_sp, exist_ok=True)
+                _ts = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+                _sp = os.path.join(_sp, f"traj_{_ts}.json")
+            else:
+                _dir = os.path.dirname(_sp)
+                if _dir:
+                    os.makedirs(_dir, exist_ok=True)
             _meta = {
                 "coeff_drag": args.coeff_drag,
                 "detector":   args.detector,
                 "n_frames":   len(_traj_log),
                 "n_bounces":  _n_bounces,
             }
-            with open(args.save_traj, "w") as _f:
+            with open(_sp, "w") as _f:
                 json.dump({"meta": _meta, "frames": _traj_log},
                           _f, separators=(",", ":"))
-            print(f"[INFO] Trajectory saved → {args.save_traj}  "
+            print(f"[INFO] Trajectory saved → {_sp}  "
                   f"({len(_traj_log)} frames, {_n_bounces} bounces detected)")
 
         print("\n[INFO] Done.")

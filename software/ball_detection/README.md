@@ -33,6 +33,26 @@ See [ball_calibration](../ball_calibration/README.md) for AprilTag-based extrins
 
 Standalone Python script — no ROS, no ZED SDK required.
 
+### Directory structure
+
+```
+ball_detection/
+├── config/
+│   ├── d455.yaml            — all runtime parameters (see Configuration below)
+│   └── settings.yaml        — ZED / ROS parameters
+├── logs/                    — recorded trajectory JSON files (gitignored)
+├── models/                  — YOLO weights (auto-downloaded on first run)
+├── src/
+│   └── ball_detection.cpp   — ZED C++ implementation
+├── ball_detection_d455.py   — main script
+├── calibrate_rest.py        — CLI tool: fit rest_x/y/z from recorded trajectory
+├── calibrate_web.py         — browser UI: interactive rest calibration
+├── generate_apriltag.py     — print AprilTag PDF for ground-plane calibration
+├── tune_hsv_web.py          — browser UI: tune HSV / MOG2 parameters
+├── viz3d.py                 — 3-D Three.js trajectory viewer
+└── webview.py               — 2-D camera + court viewer
+```
+
 ### Files
 
 | File | Purpose |
@@ -41,6 +61,8 @@ Standalone Python script — no ROS, no ZED SDK required.
 | `viz3d.py` | 3-D web viewer — Three.js trajectory + bounce visualisation, restitution sliders |
 | `webview.py` | 2-D web viewer — annotated camera feed + court top-down view |
 | `tune_hsv_web.py` | Interactive web-based HSV / MOG2 tuner (browser UI) |
+| `calibrate_rest.py` | CLI tool: fit restitution coefficients from a recorded bounce trajectory |
+| `calibrate_web.py` | Browser UI: interactive rest calibration with Plotly chart |
 | `generate_apriltag.py` | Print an A4 AprilTag PDF for ground-plane calibration |
 | `config/d455.yaml` | All runtime parameters; CLI flags override these |
 
@@ -76,6 +98,10 @@ python ball_detection_d455.py --detector both    # side-by-side comparison
 # Headless / recording
 python ball_detection_d455.py --no-viz
 python ball_detection_d455.py --record output.mp4
+
+# Record ball trajectory for rest-coefficient calibration
+# (directory path → auto-named logs/traj_YYYYMMDD_HHMMSS.json)
+python ball_detection_d455.py --save-traj logs/
 
 # Override HSV range on command line (CLI always wins over yaml)
 python ball_detection_d455.py --h-low 25 --h-high 80 --s-min 80 --v-min 80
@@ -125,9 +151,9 @@ updated via EMA and no longer need to be accurate.
 
 ### AprilTag ground calibration
 ```yaml
-tag_family: tag36h11   # must match the printed tag
-tag_id:     1          # must match the printed tag
-tag_size_m: 0.15       # outer black-square edge in metres; 0 = disable
+tag_family: tag36h11         # must match the printed tag
+tag_ids:    [0, 1, 2, 3]     # accepted tag IDs; each frame uses the largest visible tag
+tag_size_m: 0.15             # outer black-square edge in metres; 0 = disable
 ```
 
 ### Detection backend
@@ -461,3 +487,52 @@ python generate_apriltag.py --family tag36h11 --tag-id 1 --tag-size-mm 150
 
 The tag's **outer black-square edge** is the measurement used for `tag_size_m`.
 After printing, measure with a ruler and update `config/d455.yaml` if needed.
+
+---
+
+### `calibrate_rest.py` — CLI rest-coefficient calibration
+
+Fits `rest_x`, `rest_y`, `rest_z` from a recorded bounce trajectory.
+
+```bash
+# 1. Record: bounce ball ≥5 times clearly in view, ensure AprilTag is detected
+python ball_detection_d455.py --save-traj logs/
+
+# 2. Inspect Z(t) overview and identified bounces
+python calibrate_rest.py logs/traj_20260511_120000.json --plot
+
+# 3. Exclude bad segments (rolling, walking through frame) by time range
+python calibrate_rest.py logs/traj_20260511_120000.json --segments "2.5-8.0,14.0-21.5" --plot
+```
+
+**Two-stage fitting algorithm:**
+- **Stage 1 — `rest_z`**: computed from peak-height ratios of consecutive bounces (`√(h₂/h₁)`). Does not depend on EKF velocity estimates.
+- **Stage 2 — `rest_x/y`**: `differential_evolution` optimises horizontal restitution with `rest_z` held fixed.
+
+Expected results (hard court indoors): `rest_z ≈ 0.70–0.75`, `rest_x/y ≈ 0.45–0.65`, RMSE < 5 cm.
+
+---
+
+### `calibrate_web.py` — Interactive browser calibration
+
+Same algorithm as `calibrate_rest.py` but with a browser UI for selecting clean bounce segments.
+
+```bash
+python calibrate_web.py logs/traj_20260511_120000.json
+# opens http://localhost:5010
+```
+
+Workflow:
+1. **Drag** horizontally on the Z(t) chart to add bounces in a time range to the selection
+2. **Toggle** individual bounce checkboxes to include/exclude specific bounces
+3. Click **Run Optimization** (5–20 s)
+4. Inspect the per-bounce Z-fit plots — good fits have predicted ≈ actual
+5. Click the YAML block to copy `rest_x/y/z` directly into `config/d455.yaml`
+
+**When to exclude a bounce:**
+- Ball rolling on ground (actual Z stays near 0 the whole time)
+- Very weak tap (peak height < 0.05 m)
+- Ball leaves the camera frame mid-arc (trajectory truncated)
+- Two bounces merged into one event (actual Z dips back to 0 mid-arc)
+
+The `rest_z` panel shows the individual `√(h₂/h₁)` values used — if they are inconsistent (spread > 0.10), record cleaner data.
