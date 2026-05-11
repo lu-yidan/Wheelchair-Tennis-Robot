@@ -550,6 +550,16 @@ def _load_config(path):
     _get("webview_port", int, "webview_port")
     _get("mjpeg_port",   int, "mjpeg_port")
 
+    # Trajectory recording: false→"", true→"logs/", "path.json"→"path.json"
+    if "save_traj" in cfg:
+        st = cfg["save_traj"]
+        if st is False or st is None:
+            out["save_traj"] = ""
+        elif st is True:
+            out["save_traj"] = "logs/"
+        else:
+            out["save_traj"] = str(st)
+
     return out
 
 

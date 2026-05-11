@@ -100,8 +100,8 @@ python ball_detection_d455.py --no-viz
 python ball_detection_d455.py --record output.mp4
 
 # Record ball trajectory for rest-coefficient calibration
-# (directory path → auto-named logs/traj_YYYYMMDD_HHMMSS.json)
-python ball_detection_d455.py --save-traj logs/
+# (or set save_traj: true in config/d455.yaml for persistent auto-recording)
+python ball_detection_d455.py --save-traj logs/   # → logs/traj_YYYYMMDD_HHMMSS.json
 
 # Override HSV range on command line (CLI always wins over yaml)
 python ball_detection_d455.py --h-low 25 --h-high 80 --s-min 80 --v-min 80

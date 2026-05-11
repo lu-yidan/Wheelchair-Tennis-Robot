@@ -74,6 +74,13 @@ traj:      true    # 显示预测弹道（红线 + 弹跳点青色圆点）
 # "output.mp4" — 指定文件名
 record: false
 
+# ── 轨迹录制（用于 calibrate_web.py 标定恢复系数）──────────────────────────────
+# false          — 不录制
+# true           — 自动保存到 logs/traj_YYYYMMDD_HHMMSS.json
+# "logs/"        — 同上（目录路径，自动生成文件名）
+# "my_traj.json" — 指定完整文件名
+save_traj: false
+
 # ── 3D web 查看器（viz3d.py）────────────────────────────────────────────────
 # viz3d:      true  则启动后自动广播 UDP 状态到 viz3d.py
 # ctrl_port:  viz3d.py 用于回送 rest 控制的 UDP 端口
