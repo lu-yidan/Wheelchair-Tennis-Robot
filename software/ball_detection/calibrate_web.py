@@ -179,6 +179,18 @@ var _bounces = [];
 var _selected = new Set();
 var _chartOk  = false;
 var _pollId   = null;
+var _layoutTimer = null;   // debounce handle for Plotly.relayout
+
+// Defer Plotly.relayout so it never runs inside another Plotly event handler.
+// Multiple rapid calls collapse into one update 60 ms later.
+function _scheduleChartUpdate() {
+  if (_layoutTimer) clearTimeout(_layoutTimer);
+  _layoutTimer = setTimeout(function() {
+    _layoutTimer = null;
+    if (_chartOk)
+      Plotly.relayout('chart', { shapes: _shapes(), annotations: _annots() });
+  }, 60);
+}
 
 // ── Load data on page open ─────────────────────────────────────────────────
 fetch('/data').then(function(r){ return r.json(); }).then(function(d) {
@@ -191,7 +203,7 @@ fetch('/data').then(function(r){ return r.json(); }).then(function(d) {
 
   _bounces = d.bounces;
   _initChart(d.frames, d.bounces);
-  _renderCBs();
+  _renderCBs();   // create checkbox nodes once
   _updateCnt();
 });
 
@@ -220,9 +232,13 @@ function _annots() {
 }
 
 function _initChart(frames, bounces) {
+  // Downsample to ≤2000 pts for display (avoids slow re-renders)
+  var step = Math.max(1, Math.floor(frames.length / 2000));
+  var pts  = frames.filter(function(_, i){ return i % step === 0; });
+
   var trace = {
-    x: frames.map(function(f){ return f.t_rel; }),
-    y: frames.map(function(f){ return f.z; }),
+    x: pts.map(function(f){ return f.t_rel; }),
+    y: pts.map(function(f){ return f.z; }),
     mode:'lines', type:'scatter',
     line:{ color:'#4af', width:1.5 },
     name:'Z (m)',
@@ -245,7 +261,7 @@ function _initChart(frames, bounces) {
       color:'#555', gridcolor:'#1a1a1a', zerolinecolor:'#3a3a3a',
       tickfont:{ size:9 }
     },
-    shapes: _shapes(),
+    shapes:      _shapes(),
     annotations: _annots(),
     font:{ color:'#888', size:10 },
     showlegend: false
@@ -256,45 +272,52 @@ function _initChart(frames, bounces) {
       modeBarButtonsToRemove:['toImage','select2d','lasso2d'] });
   _chartOk = true;
 
-  // Drag-to-select: add bounces in range to selection
+  // Drag-to-select: bounces in the dragged range are auto-checked.
+  // Use _scheduleChartUpdate (not direct relayout) to avoid re-entry into Plotly.
   document.getElementById('chart').on('plotly_selected', function(ev) {
     if (!ev || !ev.range) return;
     var t0 = ev.range.x[0], t1 = ev.range.x[1];
     _bounces.forEach(function(b, i) {
       if (b.t_rel >= t0 && b.t_rel <= t1) _selected.add(i);
     });
-    _refresh();
+    _updateCBs();
+    _updateCnt();
+    _scheduleChartUpdate();
   });
 }
 
-function _refresh() {
-  if (_chartOk)
-    Plotly.relayout('chart', { shapes:_shapes(), annotations:_annots() });
-  _renderCBs();
-  _updateCnt();
-}
-
 // ── Checkboxes ─────────────────────────────────────────────────────────────
+// _renderCBs: called ONCE to create DOM nodes.
+// _updateCBs: called on every selection change to update class/checked state.
 function _renderCBs() {
   var g = document.getElementById('cb-grid');
   g.innerHTML = '';
   _bounces.forEach(function(b, i) {
-    var on  = _selected.has(i);
     var lbl = document.createElement('label');
-    lbl.className = 'cbl' + (on ? ' on' : '');
+    lbl.className = 'cbl';
+    lbl.dataset.idx = String(i);
     lbl.innerHTML =
-      '<input type="checkbox"' + (on ? ' checked' : '') + '>' +
+      '<input type="checkbox">' +
       b.label +
       '<span style="color:#444;margin-left:3px">' + b.t_rel.toFixed(1) + 's</span>';
     lbl.querySelector('input').addEventListener('change', function(e) {
       if (e.target.checked) _selected.add(i); else _selected.delete(i);
       lbl.className = 'cbl' + (_selected.has(i) ? ' on' : '');
-      if (_chartOk)
-        Plotly.relayout('chart', { shapes:_shapes(), annotations:_annots() });
       _updateCnt();
+      _scheduleChartUpdate();   // deferred — not direct relayout
     });
     g.appendChild(lbl);
   });
+}
+
+function _updateCBs() {
+  var items = document.getElementById('cb-grid').children;
+  for (var j = 0; j < items.length; j++) {
+    var i  = parseInt(items[j].dataset.idx, 10);
+    var on = _selected.has(i);
+    items[j].className             = 'cbl' + (on ? ' on' : '');
+    items[j].querySelector('input').checked = on;
+  }
 }
 
 function _updateCnt() {
@@ -304,8 +327,14 @@ function _updateCnt() {
   document.getElementById('btn-opt').disabled = (n < 1);
 }
 
-function selAll()   { _bounces.forEach(function(_,i){ _selected.add(i); }); _refresh(); }
-function clearSel() { _selected.clear(); _refresh(); }
+function selAll() {
+  _bounces.forEach(function(_, i){ _selected.add(i); });
+  _updateCBs(); _updateCnt(); _scheduleChartUpdate();
+}
+function clearSel() {
+  _selected.clear();
+  _updateCBs(); _updateCnt(); _scheduleChartUpdate();
+}
 
 // ── Optimization ───────────────────────────────────────────────────────────
 function runOpt() {
