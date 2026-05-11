@@ -48,7 +48,8 @@ ball_detection/
 ├── calibrate_rest.py        — CLI tool: fit rest_x/y/z from recorded trajectory
 ├── calibrate_web.py         — browser UI: interactive rest calibration
 ├── generate_apriltag.py     — print AprilTag PDF for ground-plane calibration
-├── tune_hsv_web.py          — browser UI: tune HSV / MOG2 parameters
+├── tune_hsv_web.py          — browser UI: tune HSV / MOG2 parameters (live or --video)
+├── replay.py                — offline reprocess raw video → annotated video + trajectory
 ├── viz3d.py                 — 3-D Three.js trajectory viewer
 └── webview.py               — 2-D camera + court viewer
 ```
@@ -60,7 +61,8 @@ ball_detection/
 | `ball_detection_d455.py` | Main script — camera, detection, EKF, visualisation, MJPEG server |
 | `viz3d.py` | 3-D web viewer — Three.js trajectory + bounce visualisation, restitution sliders |
 | `webview.py` | 2-D web viewer — annotated camera feed + court top-down view |
-| `tune_hsv_web.py` | Interactive web-based HSV / MOG2 tuner (browser UI) |
+| `tune_hsv_web.py` | Interactive web-based HSV / MOG2 tuner (live camera or `--video` file) |
+| `replay.py` | Offline reprocess raw `.mp4` → annotated video + trajectory JSON |
 | `calibrate_rest.py` | CLI tool: fit restitution coefficients from a recorded bounce trajectory |
 | `calibrate_web.py` | Browser UI: interactive rest calibration with Plotly chart |
 | `generate_apriltag.py` | Print an A4 AprilTag PDF for ground-plane calibration |
@@ -454,17 +456,24 @@ Same restitution sliders and ball/velocity readout as viz3d.py.
 
 ### `tune_hsv_web.py` — Interactive HSV tuner
 
+Works with both live camera and recorded video.
+
 ```bash
-python tune_hsv_web.py                          # 1280×720
+# Live camera
+python tune_hsv_web.py
 python tune_hsv_web.py --width 848 --height 480
-# open http://localhost:5000 in any browser
+# open http://localhost:5000
+
+# Recorded video (no camera required — useful for tuning offline)
+python tune_hsv_web.py --video recordings/color_video.mp4
+python tune_hsv_web.py --video recordings/color_video.mp4 --port 5001
 ```
 
 Streams a 2×2 MJPEG composite to the browser — no Qt / system fonts required.
 
 | Panel | Content |
 |---|---|
-| top-left | Raw colour frame + detected circle, FPS, ball XYZ |
+| top-left | Raw colour frame + detected circle, ball depth |
 | top-right | HSV mask (cyan tint) |
 | bottom-left | MOG2 motion mask (orange), red border when disabled |
 | bottom-right | Combined mask (green tint) used for contour detection |
@@ -472,6 +481,36 @@ Streams a 2×2 MJPEG composite to the browser — no Qt / system fonts required.
 Sliders (in browser): `H low/high`, `S min`, `V min`, `MOG2 threshold`, `Min radius`, `Circularity`.
 MOG2 toggle switch: compare HSV-only vs HSV∩MOG2 live.
 "Copy YAML" button: copies tuned values ready to paste into `config/d455.yaml`.
+
+**Video mode extras** (shown when `--video` is given):
+- Frame slider to scrub through the recording
+- ◀ / ▶ step buttons (±1 and ±10 frames)
+- Play / Pause button for sequential playback at original fps
+- MOG2 background model resets automatically on non-sequential seeks
+
+---
+
+### `replay.py` — Offline video reprocessing
+
+Re-runs the full detection pipeline (HSV → AprilTag → EKF) on a raw `.mp4` recorded with `record_raw: true`.
+
+```bash
+# Basic: generates recordings/color_video_annotated.mp4
+python replay.py recordings/color_video.mp4
+
+# Save annotated video + trajectory JSON
+python replay.py recordings/color_video.mp4 --out recordings/annotated.mp4 --save-traj logs/
+
+# Override HSV parameters from a different config
+python replay.py recordings/color_video.mp4 --config config/d455.yaml
+
+# Live preview while processing
+python replay.py recordings/color_video.mp4 --show
+```
+
+The script reads camera intrinsics from `*_intrinsics.json` (auto-saved alongside the raw video when `record_raw: true`). If no sidecar is found it falls back to D455 1280×720 factory defaults.
+
+**AprilTag detection in video**: H.264 compression blurs edges, reducing detection rate to ~40–50%. The script applies image sharpening and relaxed detector thresholds to improve reliability. Pose is held between detections (last-known pose, EMA smoothed).
 
 ---
 
