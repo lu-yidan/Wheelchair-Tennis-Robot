@@ -715,7 +715,16 @@ def main():
 
     rec_path = None
     if args.record is not None:
-        rec_path = args.record if args.record else time.strftime("ball_%Y%m%d_%H%M%S.mp4")
+        _r = args.record
+        if not _r or _r.endswith("/") or _r.endswith(os.sep) or os.path.isdir(_r):
+            _rdir = _r if _r else "recordings/"
+            os.makedirs(_rdir, exist_ok=True)
+            rec_path = os.path.join(_rdir, time.strftime("ball_%Y%m%d_%H%M%S.mp4"))
+        else:
+            _rdir = os.path.dirname(_r)
+            if _rdir:
+                os.makedirs(_rdir, exist_ok=True)
+            rec_path = _r
         print(f"[INFO] Recording to: {rec_path}")
 
     print(f"[INFO] Detector: {args.detector.upper()}")
@@ -822,6 +831,7 @@ def main():
     disp_frame  = [None]
     court_frame = [None]
     _disp_det   = [None]   # which detector label to show in MJPEG (None = composite)
+    video_writer = [None]  # cv2.VideoWriter; kept here so finally can release it safely
 
     # Trajectory log for rest-coefficient calibration (--save-traj)
     _traj_log    = []       # list of frame dicts; appended by detection_worker
@@ -1134,8 +1144,6 @@ def main():
                 p_opt = _pose["R_cw"] @ np.asarray(p_world) + _pose["tvec_flat"]
                 return optical_to_body(p_opt)
             return world_to_body(p_world, _pose["height"], _pose["pitch_rad"])
-
-        video_writer = [None]
 
         # ── Depth + EKF closure  (identical pipeline for every detector) ──────
         def _process(cx_new, cy_new, r_new, st, t_now):
@@ -1580,6 +1588,7 @@ def main():
 
         if video_writer[0] is not None:
             video_writer[0].release()
+            video_writer[0] = None
             print(f"\n[INFO] Video saved: {rec_path}")
 
     det_thread = threading.Thread(target=detection_worker, daemon=True)
@@ -1635,6 +1644,13 @@ def main():
     finally:
         stop_flag.set()
         det_thread.join(timeout=2)
+        # Release video writer here (not just inside detection_worker) so that
+        # Ctrl+C always flushes and closes the MP4 container properly.
+        if video_writer[0] is not None:
+            video_writer[0].release()
+            video_writer[0] = None
+            if rec_path:
+                print(f"\n[INFO] Video saved: {rec_path}")
         pipeline.stop()
         if viz or args.show_mask:
             cv2.destroyAllWindows()

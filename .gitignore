@@ -16,8 +16,9 @@ __pycache__/
 *.avi
 *.mkv
 
-# Trajectory logs (calibration data)
+# Trajectory logs (calibration data) and video recordings
 software/ball_detection/logs/*.json
+software/ball_detection/recordings/*.mp4
 
 # ROS build artifacts
 build/

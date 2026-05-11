@@ -27,7 +27,7 @@ tag_size_m: 0.15          # 所有 tag 的黑色方块外缘边长（米）；0 
 # hsv   — MOG2 运动掩码 + HSV 颜色分割，快，适合固定背景
 # yolo  — YOLOv8 目标检测，对复杂背景更鲁棒
 # both  — 并排对比两种方案（窗口左右分屏）
-detector: both
+detector: hsv
 
 # ── HSV 颜色范围 ───────────────────────────────────────────────────────────────
 # 用 tune_hsv.py 交互调参，按 s 键可直接打印这里的格式
@@ -69,9 +69,10 @@ show_mask: false   # 在检测窗口旁显示 HSV+MOG2 掩码（仅 hsv 单模�
 traj:      true    # 显示预测弹道（红线 + 弹跳点青色圆点）
 
 # ── 录制 ──────────────────────────────────────────────────────────────────────
-# false        — 不录制
-# true         — 自动命名（ball_YYYYMMDD_HHMMSS.mp4）
-# "output.mp4" — 指定文件名
+# false           — 不录制
+# true            — 自动保存到 recordings/ball_YYYYMMDD_HHMMSS.mp4
+# "recordings/"   — 同上（目录路径，自动生成文件名）
+# "output.mp4"    — 指定完整文件名
 record: false
 
 # ── 轨迹录制（用于 calibrate_web.py 标定恢复系数）──────────────────────────────
