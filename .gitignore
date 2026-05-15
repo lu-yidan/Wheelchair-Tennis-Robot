@@ -19,6 +19,11 @@ __pycache__/
 # Trajectory logs (calibration data) and video recordings
 software/ball_detection/logs/*.json
 software/ball_detection/recordings/*.mp4
+software/ball_detection/recordings/*_intrinsics.json
+software/ball_detection/tmp/
+
+# ZED SDK debug output (created by ZED_Diagnostic in current dir)
+ZED_Diagnostic_Results.json
 
 # ROS build artifacts
 build/
