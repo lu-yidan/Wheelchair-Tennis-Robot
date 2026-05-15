@@ -1,13 +1,21 @@
-# d455.yaml — ball_detection_d455.py 配置文件
+# d455.yaml — ball_detection.py 配置文件 (Intel RealSense D435 / D455)
 #
 # 所有参数均可被命令行参数覆盖，例如：
-#   python ball_detection_d455.py --h-low 20
+#   python ball_detection.py --h-low 20
 # 优先级：命令行 > 本文件 > 代码默认值
+
+# ── 相机后端 ───────────────────────────────────────────────────────────────────
+# 也可用 --camera-backend 命令行覆盖 (realsense | zed | webcam)
+camera:
+  backend: realsense
+  align_depth_to_color: true     # rs.align(rs.stream.color)，让深度图与彩图同尺寸同内参
+  enable_depth: true              # 关掉可省 CPU；纯 HSV+视觉测距方案可设 false
+  fps_tries: [[60, 60], [30, 30], [15, 15]]   # 启动时按顺序尝试，第一档失败则降档
 
 # ── 分辨率 / 帧率 ──────────────────────────────────────────────────────────────
 # 1280×720 @ 30fps（默认）；848×480 可跑 60fps
-width:  1280
-height: 720
+width:  848
+height: 480
 
 # ── 地面坐标系（开启后弹跳预测才有意义）────────────────────────────────────────
 # camera_height / camera_pitch 为冷启动初始值，tag 未入画面时使用。

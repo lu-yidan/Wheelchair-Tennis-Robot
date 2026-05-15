@@ -1,0 +1,83 @@
+# zedmini.yaml — ball_detection.py 配置文件 (Stereolabs ZED Mini)
+#
+# 用法:
+#   python ball_detection.py --config config/zedmini.yaml
+#
+# 同样适用于 ZED 2 / ZED 2i / ZED X — 把 resolution / fps 改成相机支持的档位即可：
+#   ZED Mini : VGA(376p)@100, HD720@60, HD1080@30, HD2K@15
+#   ZED 2/2i : 同 Mini
+#   ZED X    : SVGA(540p)@120, HD1080@60, HD1200@60
+#
+# 优先级：命令行 > 本文件 > 代码默认值
+
+# ── 相机后端 ───────────────────────────────────────────────────────────────────
+camera:
+  backend: zed
+  resolution: HD720          # HD2K | HD1080 | HD720 | VGA  (ZED X: HD1200 / SVGA)
+  fps: 60                    # 必须匹配 resolution 支持的档位
+  depth_mode: PERFORMANCE    # NEURAL | ULTRA | QUALITY | PERFORMANCE | NONE
+                             # NONE = 关掉立体深度，纯走视觉测距 fx·R/r_px (省 GPU)
+  min_depth: 0.15            # 米；ZED Mini 最小工作距离
+  max_depth: 12.0            # 米；ZED Mini 标称最远 12m
+  flip: false                # 相机倒装时设为 true
+  # serial: 12345            # 多相机时锁定特定序列号
+  # svo: "/home/lyd/Documents/ZED/HD720_SN17399724_14-57-02.svo2"   # 离线回放 .svo 录制
+  # depth_mode: NEURAL       # SDK 5.3 推荐用 NEURAL 替代 PERFORMANCE (后者 deprecated)
+
+# ── 分辨率 (供脚本日志显示；真正的画面尺寸由 camera.resolution 决定) ────────────
+width:  1280
+height: 720
+
+# ── 地面坐标系 ─────────────────────────────────────────────────────────────────
+camera_height: 0.5
+camera_pitch:  -10.0
+
+# ── AprilTag 地面标定 ──────────────────────────────────────────────────────────
+tag_family: tag36h11
+tag_ids:    [0, 1, 2, 3]
+tag_size_m: 0.15
+
+# ── 检测后端 ──────────────────────────────────────────────────────────────────
+detector: hsv
+
+# ── HSV 颜色范围 ───────────────────────────────────────────────────────────────
+h_low:  25
+h_high: 80
+s_min:  75
+v_min:  140
+
+motion: true
+mog2_threshold: 50
+min_radius_px:  3
+circularity:    0.55
+
+# ── YOLO 参数 ─────────────────────────────────────────────────────────────────
+yolo_model: models/yolov8n.pt
+yolo_imgsz: 480
+yolo_conf:  0.3
+
+# ── 物理参数 ──────────────────────────────────────────────────────────────────
+coeff_drag: 0.47
+rest_x: 0.75
+rest_y: 0.75
+rest_z: 0.65
+
+# ── 可视化 ────────────────────────────────────────────────────────────────────
+viz:       true
+show_mask: false
+traj:      true
+
+# ── 录制 ──────────────────────────────────────────────────────────────────────
+record: true
+record_raw: true
+
+save_traj: true
+
+# ── Web 查看器 ────────────────────────────────────────────────────────────────
+viz3d:          true
+viz3d_port:     5565
+ctrl_port:      5566
+
+webview:        true
+webview_port:   5567
+mjpeg_port:     5568

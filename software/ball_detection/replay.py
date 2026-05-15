@@ -23,7 +23,7 @@ import cv2
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from ball_detection_d455 import (
+from ball_detection import (
     PhysicsEKF, detect_tennis_ball, _body_to_pixel, _meas_covariance, _FPS,
     BALL_RADIUS, COAST_FRAMES,
     optical_to_body, body_to_optical, body_to_world, world_to_body,

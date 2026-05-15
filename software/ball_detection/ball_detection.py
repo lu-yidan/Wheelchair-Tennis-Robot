@@ -1,11 +1,18 @@
 """
-ball_detection_d455.py
+ball_detection.py
 
-Intel RealSense D455 tennis ball detection + physics-based trajectory prediction.
+Multi-camera tennis ball detection + physics-based trajectory prediction.
 Standalone Python replacement for ball_detection.cpp (ZED SDK) for single-camera testing.
 
+Camera backends (selected via `camera.backend` in the YAML config):
+    realsense → Intel RealSense D435 / D455           (config/d455.yaml)
+    zed       → Stereolabs ZED Mini / ZED 2 / ZED X   (config/zedmini.yaml)
+    webcam    → Any V4L2 / UVC webcam (RGB-only)      (config/webcam.yaml)
+                e.g. HIKROBOT MV-CS016 industrial GS, FLIR Blackfly UVC mode,
+                     Logitech BRIO 4K, Razer Kiyo Pro, Arducam IMX477
+
 Detection:   MOG2 motion mask + HSV colour segmentation  (ported from ball_detection.cpp)
-Depth:       visual (fx·R/r_px) fused with D455 sensor depth  (from catch_ball)
+Depth:       visual (fx·R/r_px), fused with sensor depth when available
 Tracking:    6-state physics EKF — gravity + quadratic drag  (ported from ball_ekf.cpp)
 Prediction:  physics rollout with ground bounce  (from ball_ekf.cpp::predict)
 
@@ -20,16 +27,22 @@ Physics constants (ball_localization/src/ball_ekf.cpp):
 Coordinate frame: camera body (X-forward, Y-left, Z-up).  Gravity → −Z.
 
 Requirements:
-    conda activate catchball          # pyrealsense2, opencv-python, numpy, scipy
+    conda activate catchball
+    # plus, depending on backend:
+    #   realsense → pyrealsense2 (already in catchball)
+    #   zed       → ZED SDK + pyzed.sl  (run /usr/local/zed/get_python_api.py)
+    #   webcam    → opencv only (already in catchball)
 
 Usage:
-    python ball_detection_d455.py                         # 1280×720, viz on
-    python ball_detection_d455.py --no-viz                 # headless
-    python ball_detection_d455.py --show-mask              # show HSV+motion mask
-    python ball_detection_d455.py --width 848 --height 480 # 60fps mode
-    python ball_detection_d455.py --no-motion              # skip MOG2 (pure HSV)
-    python ball_detection_d455.py --h-low 10 --h-high 35   # HSV hue from settings.yaml
-    python ball_detection_d455.py --coeff-drag 0.47        # tune drag
+    python ball_detection.py                                 # default = config/d455.yaml
+    python ball_detection.py --config config/zedmini.yaml    # ZED Mini
+    python ball_detection.py --config config/webcam.yaml     # generic webcam
+    python ball_detection.py --no-viz                         # headless
+    python ball_detection.py --show-mask                      # show HSV+motion mask
+    python ball_detection.py --width 848 --height 480         # ask backend for this resolution
+    python ball_detection.py --no-motion                      # skip MOG2 (pure HSV)
+    python ball_detection.py --h-low 10 --h-high 35           # HSV hue overrides
+    python ball_detection.py --coeff-drag 0.47                # tune drag
 """
 
 import argparse
@@ -39,12 +52,8 @@ import threading
 import time
 import numpy as np
 import cv2
-try:
-    import pyrealsense2 as rs
-    _HAS_RS = True
-except ImportError:
-    rs = None          # replay.py and calibrate scripts import from here without hardware
-    _HAS_RS = False
+
+import cameras as _cameras_pkg   # noqa: F401  (registers backend factory)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -558,6 +567,12 @@ def _load_config(path):
     if "record_raw" in cfg:
         out["record_raw"] = bool(cfg["record_raw"])
 
+    # Camera backend section — pass through verbatim for cameras.from_config()
+    if "camera" in cfg and isinstance(cfg["camera"], dict):
+        out["_camera_section"] = dict(cfg["camera"])
+        if "backend" in cfg["camera"]:
+            out["camera_backend"] = str(cfg["camera"]["backend"])
+
     # Trajectory recording: false→"", true→"logs/", "path.json"→"path.json"
     if "save_traj" in cfg:
         st = cfg["save_traj"]
@@ -589,6 +604,9 @@ def main():
         description="RealSense D455 tennis ball detection + physics EKF trajectory prediction")
     parser.add_argument("--config",       default=_DEFAULT_CONFIG,
                         help="YAML config file (default: config/d455.yaml)")
+    parser.add_argument("--camera-backend", default="realsense",
+                        choices=["realsense", "zed", "webcam"],
+                        help="Camera backend (overrides config camera.backend)")
     parser.add_argument("--no-viz",       action="store_true", help="disable OpenCV window")
     parser.add_argument("--show-mask",    action="store_true", help="overlay HSV+motion mask")
     parser.add_argument("--no-motion",    action="store_true", help="disable MOG2 motion filter")
@@ -757,77 +775,24 @@ def main():
         print("[INFO] World frame OFF → EKF in camera body frame, bounce prediction disabled")
         print("[INFO]   Set --camera-height or --tag-size-m to enable world frame")
 
-    # ── RealSense pipeline ────────────────────────────────────────────────────
-    pipeline   = rs.pipeline()
-    _FPS_TRIES = [(60, 60), (30, 30), (15, 15)]
+    # ── Camera backend (realsense | zed | webcam — see config[camera][backend])
+    from cameras import from_config as _cam_from_config
+    # Merge yaml `camera:` section with CLI override; CLI --camera-backend always wins.
+    _cam_section = dict(getattr(args, "_camera_section", None) or {})
+    _cam_section["backend"] = args.camera_backend
+    _cam_cfg = {
+        "width":  args.width,
+        "height": args.height,
+        "camera": _cam_section,
+    }
+    cam = _cam_from_config(_cam_cfg)
+    cam.start()
+    intr = cam.intrinsics
+    fx   = intr.fx   # used for visual depth estimate
+    has_depth = cam.has_depth
 
-    def _hw_reset():
-        """Hardware-reset the first RealSense device and wait for re-enumeration."""
-        nonlocal pipeline
-        devs = rs.context().query_devices()
-        if len(devs) == 0:
-            raise RuntimeError("No RealSense device found.")
-        print("[INFO] Hardware reset...")
-        devs[0].hardware_reset()
-        time.sleep(8)
-        pipeline = rs.pipeline()
-
-    def _start_pipeline():
-        nonlocal pipeline
-        # Pre-emptive reset: clears stale /dev/videoX nodes from previous sessions
-        try:
-            _hw_reset()
-        except RuntimeError as e:
-            raise RuntimeError(f"No RealSense device found on startup: {e}")
-        last_err = None
-        for c_fps, d_fps in _FPS_TRIES:
-            rs_cfg = rs.config()
-            rs_cfg.enable_stream(rs.stream.color, args.width, args.height, rs.format.bgr8, c_fps)
-            rs_cfg.enable_stream(rs.stream.depth, args.width, args.height, rs.format.z16,  d_fps)
-            for attempt in range(2):
-                try:
-                    print(f"[INFO] Starting RealSense ({c_fps}/{d_fps} Hz attempt {attempt+1})...")
-                    profile = pipeline.start(rs_cfg)
-                except RuntimeError as e:
-                    msg = str(e).lower()
-                    if "resolve" in msg or "couldn't" in msg:
-                        # profile/resolution not supported → try next fps
-                        last_err = e
-                        print(f"[WARN] Profile not supported: {e}")
-                        break
-                    elif "no such file" in msg or "cannot open" in msg or "map_device" in msg:
-                        # stale /dev/videoX node → hardware reset and retry
-                        print(f"[WARN] Stale device node ({e}); resetting...")
-                        _hw_reset()
-                        continue
-                    raise
-                try:
-                    pipeline.wait_for_frames(timeout_ms=5000)
-                    print(f"[INFO] RealSense OK ({c_fps}/{d_fps} Hz)")
-                    return profile
-                except RuntimeError:
-                    print("[WARN] Frame timeout — hardware reset...")
-                    pipeline.stop()
-                    _hw_reset()
-        raise RuntimeError(f"RealSense failed. Tried {_FPS_TRIES}. Last: {last_err!r}")
-
-    profile = _start_pipeline()
-
-    color_profile = profile.get_stream(rs.stream.color).as_video_stream_profile()
-    depth_profile = profile.get_stream(rs.stream.depth).as_video_stream_profile()
-    color_intrin  = color_profile.get_intrinsics()
-    depth_intrin  = depth_profile.get_intrinsics()
-    c2d_extr      = color_profile.get_extrinsics_to(depth_profile)
-    depth_scale   = profile.get_device().first_depth_sensor().get_depth_scale()
-    dh, dw        = depth_intrin.height, depth_intrin.width
-
-    fx = color_intrin.fx   # used for visual depth estimate
-
-    print(f"[INFO] Color  fx={color_intrin.fx:.1f} fy={color_intrin.fy:.1f} "
-          f"ppx={color_intrin.ppx:.1f} ppy={color_intrin.ppy:.1f}")
-    t_cd = c2d_extr.translation
-    print(f"[INFO] Color→Depth  tx={t_cd[0]*1000:.1f}mm "
-          f"ty={t_cd[1]*1000:.1f}mm tz={t_cd[2]*1000:.1f}mm")
+    print(f"[INFO] Camera intr  fx={intr.fx:.1f} fy={intr.fy:.1f} "
+          f"ppx={intr.ppx:.1f} ppy={intr.ppy:.1f}  depth={'YES' if has_depth else 'NO (visual only)'}")
     print(f"[INFO] Max visual range ≈ {fx * BALL_RADIUS / args.min_radius:.1f} m "
           f"(fx={fx:.0f}, R={BALL_RADIUS}m, min_r={args.min_radius}px)")
 
@@ -836,10 +801,10 @@ def main():
         _intr_path = os.path.splitext(rec_path)[0] + "_intrinsics.json"
         with open(_intr_path, "w") as _f:
             json.dump({
-                "fx": color_intrin.fx, "fy": color_intrin.fy,
-                "ppx": color_intrin.ppx, "ppy": color_intrin.ppy,
-                "width": color_intrin.width, "height": color_intrin.height,
-                "dist": list(color_intrin.coeffs[:5]),
+                "fx": intr.fx, "fy": intr.fy,
+                "ppx": intr.ppx, "ppy": intr.ppy,
+                "width": intr.width, "height": intr.height,
+                "dist": list(intr.coeffs[:5]),
                 "tag_family": args.tag_family, "tag_ids": list(args.tag_ids),
                 "tag_size_m": tag_size_m,
                 "coeff_drag": args.coeff_drag,
@@ -1025,11 +990,11 @@ def main():
                 [-_th, -_th, 0.0],
             ], dtype=np.float32)
             _cam_mat  = np.array([
-                [color_intrin.fx, 0,               color_intrin.ppx],
-                [0,               color_intrin.fy,  color_intrin.ppy],
-                [0,               0,                1               ],
+                [intr.fx, 0,       intr.ppx],
+                [0,       intr.fy, intr.ppy],
+                [0,       0,       1       ],
             ], dtype=np.float32)
-            _dist     = np.array(color_intrin.coeffs[:5], dtype=np.float32)
+            _dist     = np.array(intr.coeffs[:5], dtype=np.float32)
             print(f"[INFO] ArUco detector ready: {args.tag_family} ids={args.tag_ids} "
                   f"size={tag_size_m:.3f}m")
 
@@ -1193,28 +1158,24 @@ def main():
             detected = (cx_new is not None)
             coasting = not detected
 
-            # Visual depth: depth = fx · R / r_px
+            # Visual depth: depth = fx · R / r_px  (always available — needs only fx + ball radius)
             depth_vis = (fx * BALL_RADIUS / st["r"]) if st["r"] and st["r"] > 0 else 0.0
 
-            # Sensor depth: 3-step Color→Depth mapping
-            ndcx = (st["cx"] - color_intrin.ppx) / color_intrin.fx
-            ndcy = (st["cy"] - color_intrin.ppy) / color_intrin.fy
-            dx0  = int(np.clip(ndcx * depth_intrin.fx + depth_intrin.ppx + 0.5, 0, dw-1))
-            dy0  = int(np.clip(ndcy * depth_intrin.fy + depth_intrin.ppy + 0.5, 0, dh-1))
-            raw0 = depth_arr[dy0, dx0]
-            d_coarse = raw0 * depth_scale if raw0 > 0 else 1.0
-            tx = c2d_extr.translation[0]; ty = c2d_extr.translation[1]
-            dx = int(np.clip(ndcx * depth_intrin.fx + depth_intrin.ppx
-                             + tx / d_coarse * depth_intrin.fx + 0.5, 0, dw-1))
-            dy = int(np.clip(ndcy * depth_intrin.fy + depth_intrin.ppy
-                             + ty / d_coarse * depth_intrin.fy + 0.5, 0, dh-1))
-            r  = DEPTH_SAMPLE_R
-            patch   = (depth_arr[max(0, dy-r):min(dh, dy+r+1),
-                                  max(0, dx-r):min(dw, dx+r+1)]
-                       .astype(np.float32) * depth_scale)
-            valid_d = patch[(patch > DEPTH_MIN) & (patch < DEPTH_MAX)]
-            d_surf  = float(np.median(valid_d)) if len(valid_d) > 0 else 0.0
-            depth_sensor = d_surf + BALL_RADIUS if d_surf > 0 else 0.0
+            # Sensor depth: only if backend supplied an aligned depth frame.
+            # depth_arr is in metres (float32) and on the SAME pixel grid as colour
+            # (camera backends do alignment internally — see cameras/realsense.py
+            # rs.align(rs.stream.color), and ZED's depth is left-cam-aligned).
+            depth_sensor = 0.0
+            if depth_arr is not None:
+                ih, iw = depth_arr.shape[:2]
+                dx = int(np.clip(st["cx"], 0, iw - 1))
+                dy = int(np.clip(st["cy"], 0, ih - 1))
+                r  = DEPTH_SAMPLE_R
+                patch   = depth_arr[max(0, dy-r):min(ih, dy+r+1),
+                                    max(0, dx-r):min(iw, dx+r+1)]
+                valid_d = patch[(patch > DEPTH_MIN) & (patch < DEPTH_MAX)]
+                d_surf  = float(np.median(valid_d)) if len(valid_d) > 0 else 0.0
+                depth_sensor = d_surf + BALL_RADIUS if d_surf > 0 else 0.0
 
             vis_ok    = DEPTH_MIN < depth_vis    < DEPTH_MAX
             sensor_ok = DEPTH_MIN < depth_sensor < DEPTH_MAX
@@ -1230,8 +1191,7 @@ def main():
                 depth_fused = 0.0
 
             if depth_fused > 0 and detected:
-                p_opt  = rs.rs2_deproject_pixel_to_point(
-                    color_intrin, [st["cx"], st["cy"]], depth_fused)
+                p_opt  = intr.deproject(st["cx"], st["cy"], depth_fused)
                 p_body = optical_to_body(p_opt)
                 # Convert to world frame (Z=0=ground) using full R matrix when available
                 p_ekf = _to_world(p_body) if _world_active() else p_body
@@ -1312,7 +1272,7 @@ def main():
                 for i, h_pt in enumerate(hist):
                     t = i / max(n - 1, 1)          # 0 = oldest, 1 = newest
                     pt_body = _to_body(h_pt)
-                    px = _body_to_pixel(pt_body, color_intrin)
+                    px = _body_to_pixel(pt_body, intr)
                     if px is None:
                         prev_px = None
                         continue
@@ -1330,7 +1290,7 @@ def main():
                 last_z   = traj_pts[0][1][2]
                 for _, pt in traj_pts:
                     pt_body = _to_body(pt) if _world_active() else pt
-                    px = _body_to_pixel(pt_body, color_intrin)
+                    px = _body_to_pixel(pt_body, intr)
                     if px is None:
                         prev_px = None; continue
                     is_bounce = (last_z > 0.01 and pt[2] <= 0.01)
@@ -1400,14 +1360,10 @@ def main():
             with buf_lock:
                 frames = buf_frames
 
-            cf = frames.get_color_frame()
-            df = frames.get_depth_frame()
-            if not cf or not df:
-                continue
-
-            color     = np.asanyarray(cf.get_data()).copy()
-            depth_arr = np.asanyarray(df.get_data()).copy()
-            t_now     = time.perf_counter()
+            # frames is a Frame dataclass from cameras.base
+            color     = frames.color
+            depth_arr = frames.depth   # may be None for RGB-only cameras
+            t_now     = frames.t
 
             # ── Per-frame AprilTag ground calibration ──────────────────────────
             _pose["age"] = min(_pose["age"] + 1, 9999)
@@ -1646,7 +1602,9 @@ def main():
     print("[INFO] Keys: q=quit  x/X=rest_x±0.05  y/Y=rest_y±0.05  z/Z=rest_z±0.05  s=save")
     try:
         while True:
-            frames = pipeline.wait_for_frames()
+            frames = cam.grab()
+            if frames is None:
+                continue
             with buf_lock:
                 buf_frames = frames
             buf_updated.set()
@@ -1681,7 +1639,10 @@ def main():
             video_writer[0] = None
             if rec_path:
                 print(f"\n[INFO] Video saved: {rec_path}")
-        pipeline.stop()
+        try:
+            cam.stop()
+        except Exception:
+            pass
         if viz or args.show_mask:
             cv2.destroyAllWindows()
 
