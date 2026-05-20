@@ -866,7 +866,9 @@ def main():
     _traj_prev_z = [None]  # previous frame's Z for bounce detection
 
     # ── Internal full-resolution MJPEG server ─────────────────────────────────
-    if args.webview and getattr(args, "mjpeg_port", 0) > 0:
+    # Runs whenever mjpeg_port > 0 (independent of webview UDP).  Lets a static
+    # HTML monitor page embed multiple cameras without needing webview.py.
+    if getattr(args, "mjpeg_port", 0) > 0:
         import socketserver as _mjpeg_ss
         from http.server import BaseHTTPRequestHandler as _MJPEG_BHR, HTTPServer as _MJPEG_HS
 
@@ -912,7 +914,7 @@ def main():
         _mjpeg_srv = _MJPEGServer(("0.0.0.0", args.mjpeg_port), _MJPEGHandler)
         threading.Thread(target=_mjpeg_srv.serve_forever, daemon=True).start()
         print(f"[INFO] MJPEG  → http://localhost:{args.mjpeg_port}/main  "
-              f"(full resolution, used by webview.py)")
+              f"(full resolution; embed in monitor.html or webview.py)")
 
     # ── Detection thread ──────────────────────────────────────────────────────
     def detection_worker():
@@ -1546,8 +1548,9 @@ def main():
                 elif not _world_active():
                     _hist[_lbl].clear()
 
+            _mjpeg_on = getattr(args, "mjpeg_port", 0) > 0
             if (viz or args.show_mask or rec_path is not None
-                    or _webview_sock is not None) and panels:
+                    or _webview_sock is not None or _mjpeg_on) and panels:
                 if len(panels) == 2:
                     # Both mode: scale each panel to 50% and place side-by-side
                     h, w = color.shape[:2]
@@ -1569,7 +1572,7 @@ def main():
                     video_writer[0].write(_rec_frame)
 
                 # Update shared display buffers (for OpenCV window + MJPEG server)
-                if viz or args.show_mask or args.webview:
+                if viz or args.show_mask or args.webview or _mjpeg_on:
                     _now_t = time.perf_counter()
                     # Build label→panel map for detector selection
                     _panel_map = {lbl: panels[i]
