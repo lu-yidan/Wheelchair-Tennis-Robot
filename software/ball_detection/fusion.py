@@ -68,6 +68,14 @@ def main():
     ap.add_argument("--rest-z",     type=float, default=DEFAULT_COEFF_REST_Z)
     ap.add_argument("--max-age-ms", type=int, default=200,
                     help="drop packets older than this (clock skew protection, default 200)")
+    ap.add_argument("--require-tag", action="store_true", default=True,
+                    help="drop packets where the source has no AprilTag in view "
+                         "(prevents mixing world frames; default ON)")
+    ap.add_argument("--no-require-tag", dest="require_tag", action="store_false",
+                    help="accept packets even without a tag (for debugging only)")
+    ap.add_argument("--max-tag-age", type=int, default=30,
+                    help="drop packets when source's tag_age > this many frames "
+                         "(stale calibration; default 30 = ~1s @30fps)")
     ap.add_argument("--print-hz",   type=float, default=20.0,
                     help="terminal status refresh rate (default 20)")
     # Optional forwarding to existing viewers (same ports as ball_detection)
@@ -115,7 +123,8 @@ def main():
             now = time.time()
 
             if pkt is not None:
-                _consume(pkt, now, ekf, stats, args.max_age_ms)
+                _consume(pkt, now, ekf, stats, args.max_age_ms,
+                         args.require_tag, args.max_tag_age)
 
             # Throttled terminal status + viewer forwarding
             if now - last_print_t >= print_period:
@@ -136,12 +145,14 @@ def main():
 #  Internals
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _consume(pkt, now, ekf, stats, max_age_ms):
+def _consume(pkt, now, ekf, stats, max_age_ms, require_tag, max_tag_age):
     try:
         t_pkt  = float(pkt["t"])
         cam_id = str(pkt["cam_id"])
         pos    = np.asarray(pkt["pos"], dtype=float)
         cov    = max(float(pkt.get("cov", 0.05)), 1e-6)
+        tag_id = int(pkt.get("tag_id", -1))
+        tag_age = int(pkt.get("tag_age", 9999))
     except (KeyError, TypeError, ValueError):
         return
 
@@ -150,9 +161,9 @@ def _consume(pkt, now, ekf, stats, max_age_ms):
         # Clock skew or buffer pile-up; ignore quietly to avoid log flood
         return
 
-    # Per-source bookkeeping
+    # Per-source bookkeeping — always update stats so we can show "dropping" status
     s = stats.setdefault(cam_id, {
-        "n_total": 0, "t_first": now, "t_last": now,
+        "n_total": 0, "n_dropped": 0, "t_first": now, "t_last": now,
         "last_pos": None, "last_depth": 0.0, "last_tag": -1, "last_tag_age": 9999,
         "ema_dt": None,
     })
@@ -164,8 +175,14 @@ def _consume(pkt, now, ekf, stats, max_age_ms):
     s["t_last"]  = now
     s["last_pos"] = pos
     s["last_depth"] = float(pkt.get("depth", 0.0))
-    s["last_tag"] = int(pkt.get("tag_id", -1))
-    s["last_tag_age"] = int(pkt.get("tag_age", 9999))
+    s["last_tag"] = tag_id
+    s["last_tag_age"] = tag_age
+
+    # Reject packets that aren't using a fresh AprilTag — they're in a different
+    # world frame than tag-calibrated sources and fusing them causes drift.
+    if require_tag and (tag_id < 0 or tag_age > max_tag_age):
+        s["n_dropped"] += 1
+        return
 
     # EKF update — isotropic 3×3 measurement noise from the cov scalar.
     # (Phase 2 idea: receive a full 3×3 in world frame for proper anisotropic fusion.)
@@ -179,13 +196,19 @@ def _print_status(stats, ekf, now):
         s = stats[cam_id]
         age = now - s["t_last"]
         if age > 1.0:
-            tag = "STALE"
+            fps_str = "STALE"
         elif s["ema_dt"] and s["ema_dt"] > 0:
-            tag = f"{1.0 / s['ema_dt']:.0f}fps"
+            fps_str = f"{1.0 / s['ema_dt']:.0f}fps"
         else:
-            tag = "  ?fps"
+            fps_str = "  ?fps"
         depth = s["last_depth"]
-        parts.append(f"[{cam_id} {tag} d={depth:.1f}m tag={s['last_tag']}{'!' if s['last_tag_age']>30 else ''}]")
+        # Show drop ratio when meaningful — quickly surfaces "Razer can't see tag" type bugs
+        drop_str = ""
+        if s["n_total"] > 0 and s["n_dropped"] > 0:
+            drop_pct = 100.0 * s["n_dropped"] / s["n_total"]
+            drop_str = f" DROP {drop_pct:.0f}%"
+        tag_str = f"tag={s['last_tag']}{'!' if s['last_tag_age']>30 else ''}"
+        parts.append(f"[{cam_id} {fps_str} d={depth:.1f}m {tag_str}{drop_str}]")
 
     if ekf.initialized:
         x, y, z   = ekf.x[:3]
