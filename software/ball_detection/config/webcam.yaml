@@ -18,14 +18,13 @@ camera:
   device:  2          # /dev/video2 (AONI 2K QHD); 字符串路径或 RTSP URL 也可
   fourcc:  MJPG       # MJPG → 高帧率 (USB UVC 默认)；YUYV 通常被限制在 30fps
   fps:     60
-  # ⚠ 标定后填这里：以下数字是粗估 (用 width 当 fx，对 ~70° HFOV 摄像头近似成立)
-  # 用 cv2.calibrateCamera + 8×6 棋盘标定后替换，AprilTag 才能解出准确高度
+  # AONI 2K QHD Webcam @1920×1080 标定结果 (calibrate_intrinsics.py, 62 张, 0.46px RMS)
   intrinsics:
-    fx:  1400.0    # ≈ 1920 / (2·tan(35°))，假设 ~70° HFOV
-    fy:  1400.0
-    ppx: 960.0     # = width / 2
-    ppy: 540.0     # = height / 2
-    dist: [0.0, 0.0, 0.0, 0.0, 0.0]   # [k1, k2, p1, p2, k3]
+    fx:  1331.86
+    fy:  1323.24
+    ppx: 1019.36
+    ppy: 477.47
+    dist: [0.040168, 0.065459, -0.028067, -0.006229, -0.021268]
 
 # ── 分辨率 ────────────────────────────────────────────────────────────────────
 # AONI 2K QHD 实测支持：1920×1080@60、1280×720@60 (MJPG)
@@ -50,7 +49,7 @@ h_high: 80
 s_min:  75
 v_min:  140
 
-motion: true
+motion: false
 mog2_threshold: 50
 min_radius_px:  3
 circularity:    0.55
