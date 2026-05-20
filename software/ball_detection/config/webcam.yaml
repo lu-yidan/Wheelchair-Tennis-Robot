@@ -41,6 +41,10 @@ tag_family: tag36h11
 tag_ids:    [0, 1, 2, 3]
 tag_size_m: 0.15
 
+# ── Tag → world map (多相机融合必需) ──────────────────────────────────────────
+# 每个 tag 在共享 world 坐标系里的 6DoF; 检测到不同 tag 都会被映回同一个 world.
+tag_world_map: config/tag_world_map.yaml
+
 # ── 检测后端 ──────────────────────────────────────────────────────────────────
 detector: hsv
 

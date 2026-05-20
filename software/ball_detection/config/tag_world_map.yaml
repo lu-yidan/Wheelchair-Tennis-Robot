@@ -1,0 +1,39 @@
+# tag_world_map.yaml — 把每张 AprilTag 在共享 world 坐标系里的 6DoF 位姿写在这儿
+#
+# 用法:
+#   在 webcam.yaml / razer.yaml 里加一行:
+#     tag_world_map: config/tag_world_map.yaml
+#
+#   ball_detection.py 启动会加载它. 检测到哪张 tag, 就把球的 tag 本地坐标
+#   按对应 T_tag_world 变换到共享 world 系 → 不同相机看不同 tag 也能融合成
+#   一致的 world 坐标.
+#
+# 坐标约定:
+#   world: Z 朝上, X/Y 在地面 (右手系, 你自己定 X 朝向)
+#   tag:   tag 正面看时, X 右, Y 上, Z 出 tag 表面
+#
+#   贴地 (tag 平摆地上, 正面朝上) → tag Z = world Z = 朝上 → 用纯 yaw 旋转
+#
+# 字段:
+#   id          tag ID (整数, 与 tag_ids 里列的相符)
+#   pos         tag 中心在 world 系的位置 [x, y, z] (米)
+#   rpy_deg     roll-pitch-yaw 欧拉角 (度), XYZ 内旋. 贴地默认全 0.
+#
+# ── 当前布局: 十字 (4 张 tag, 间距 1.2m, 都贴地朝上) ────────────────────────────
+#
+#         ●  id=2 (0, +0.6)
+#         │
+#   id=1  │  id=0
+#  ──────●──┼──●──────  +X
+#  (-0.6,0) │ (+0.6,0)
+#         │
+#         ●  id=3 (0, -0.6)
+#                +Y ↑
+#
+# 摆好之后用尺子量一下实际中心坐标, 修这里. 0.6m 只是占位.
+
+tags:
+  - {id: 0, pos: [ 0.6,  0.0, 0.0], rpy_deg: [0, 0, 0]}    # 东
+  - {id: 1, pos: [-0.6,  0.0, 0.0], rpy_deg: [0, 0, 0]}    # 西
+  - {id: 2, pos: [ 0.0,  0.6, 0.0], rpy_deg: [0, 0, 0]}    # 北
+  - {id: 3, pos: [ 0.0, -0.6, 0.0], rpy_deg: [0, 0, 0]}    # 南

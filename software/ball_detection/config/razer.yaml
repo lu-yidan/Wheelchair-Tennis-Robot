@@ -36,6 +36,9 @@ tag_family: tag36h11
 tag_ids:    [0, 1, 2, 3]
 tag_size_m: 0.15
 
+# 跟 AONI 共用同一份 world map → 两机看不同 tag 也能融合到同一 world
+tag_world_map: config/tag_world_map.yaml
+
 # ── 检测 ──────────────────────────────────────────────────────────────────────
 detector: hsv
 

@@ -576,10 +576,11 @@ def _load_config(path):
             out["cam_id"] = str(cfg["camera"]["id"])
 
     # Multi-camera fusion broadcasting
-    _get("cam_id",       str, "cam_id")
-    _get("fusion_host",  str, "fusion_host")
-    _get("fusion_port",  int, "fusion_port")
-    _get("port_offset",  int, "port_offset")
+    _get("cam_id",         str, "cam_id")
+    _get("fusion_host",    str, "fusion_host")
+    _get("fusion_port",    int, "fusion_port")
+    _get("port_offset",    int, "port_offset")
+    _get("tag_world_map",  str, "tag_world_map")
 
     # Trajectory recording: false→"", true→"logs/", "path.json"→"path.json"
     if "save_traj" in cfg:
@@ -684,6 +685,9 @@ def main():
     parser.add_argument("--port-offset",  type=int, default=0,
                         help="offset added to all UDP/HTTP ports — use a different value "
                              "per instance when running multiple detectors on the same host")
+    parser.add_argument("--tag-world-map", default="",
+                        help="path to tag_world_map.yaml — each AprilTag's 6DoF pose in "
+                             "the shared world frame; empty = use tag-local frame (legacy)")
     parser.set_defaults(**_cfg)   # config file values override code defaults
     args = parser.parse_args()    # CLI args override everything
 
@@ -749,6 +753,35 @@ def main():
         _fusion_sock = _socket_mod.socket(_socket_mod.AF_INET, _socket_mod.SOCK_DGRAM)
         print(f"[INFO] fusion UDP → {args.fusion_host}:{args.fusion_port}  "
               f"cam_id={args.cam_id}  (start fusion.py on this port)")
+
+    # ── Tag→world map: lets multiple cameras seeing different tags agree on
+    # a shared world frame (essential for multi-cam fusion).  Without it, each
+    # detector's world coords are tag-local — fusion of two cameras only works
+    # when they look at the SAME tag.
+    # Map format: { tag_id: (R 3×3, t 3,) }   such that world = R @ tag_local + t
+    _tag_world_map = {}
+    if args.tag_world_map:
+        try:
+            import yaml as _yaml_mod
+            with open(args.tag_world_map) as _f:
+                _twm = _yaml_mod.safe_load(_f) or {}
+            for _entry in (_twm.get("tags") or []):
+                _id  = int(_entry["id"])
+                _pos = np.asarray(_entry["pos"], dtype=float).reshape(3)
+                _rpy = np.radians(np.asarray(_entry.get("rpy_deg", [0, 0, 0]), dtype=float))
+                # XYZ intrinsic Euler (roll about X, pitch about Y, yaw about Z)
+                _cr, _sr = np.cos(_rpy[0]), np.sin(_rpy[0])
+                _cp, _sp = np.cos(_rpy[1]), np.sin(_rpy[1])
+                _cy, _sy = np.cos(_rpy[2]), np.sin(_rpy[2])
+                _Rx = np.array([[1,0,0],[0,_cr,-_sr],[0,_sr,_cr]])
+                _Ry = np.array([[_cp,0,_sp],[0,1,0],[-_sp,0,_cp]])
+                _Rz = np.array([[_cy,-_sy,0],[_sy,_cy,0],[0,0,1]])
+                _tag_world_map[_id] = (_Rz @ _Ry @ _Rx, _pos)
+            print(f"[INFO] tag world map: {len(_tag_world_map)} tags from {args.tag_world_map}  "
+                  f"(ids={sorted(_tag_world_map.keys())})")
+        except Exception as _e:
+            print(f"[WARN] cannot load tag_world_map {args.tag_world_map}: {_e}")
+            _tag_world_map = {}
 
     # Control listener — receives rest / det updates from viz3d.py and webview.py
     if args.viz3d or args.webview:
@@ -1158,20 +1191,40 @@ def main():
             """True when a world frame (Z=0=ground) transform is available."""
             return _pose["R_cw"] is not None or _pose["height"] > 0.01
 
+        def _tag_to_world(p_tag_local):
+            """Apply the loaded tag_world_map entry for the active tag.  Returns
+            p_tag_local unchanged when the tag isn't in the map (so single-cam
+            users without a map still get tag-local coords like before)."""
+            entry = _tag_world_map.get(_pose["tag_id"])
+            if entry is None:
+                return p_tag_local
+            R_tw, t_tw = entry
+            return R_tw @ np.asarray(p_tag_local) + t_tw
+
+        def _world_to_tag(p_world):
+            entry = _tag_world_map.get(_pose["tag_id"])
+            if entry is None:
+                return p_world
+            R_tw, t_tw = entry
+            return R_tw.T @ (np.asarray(p_world) - t_tw)
+
         def _to_world(p_body):
-            """Camera body frame → world frame (Z=0=ground).
-            Uses full R matrix from solvePnP when available (handles roll/yaw/pitch);
-            falls back to EMA pitch-only model when R_cw is not yet set.
+            """Camera body frame → world frame.
+            With tag_world_map: world frame is the SHARED frame defined by the map.
+            Without:            world frame is tag-local (legacy single-cam behaviour).
+            Falls back to EMA pitch-only model when no AprilTag has ever been seen.
             """
             if _pose["R_cw"] is not None:
                 p_opt = body_to_optical(p_body)
-                return _pose["R_cw"].T @ (p_opt - _pose["tvec_flat"])
+                p_tag_local = _pose["R_cw"].T @ (p_opt - _pose["tvec_flat"])
+                return _tag_to_world(p_tag_local)
             return body_to_world(p_body, _pose["height"], _pose["pitch_rad"])
 
         def _to_body(p_world):
             """World frame → camera body frame.  Inverse of _to_world."""
             if _pose["R_cw"] is not None:
-                p_opt = _pose["R_cw"] @ np.asarray(p_world) + _pose["tvec_flat"]
+                p_tag_local = _world_to_tag(p_world)
+                p_opt = _pose["R_cw"] @ np.asarray(p_tag_local) + _pose["tvec_flat"]
                 return optical_to_body(p_opt)
             return world_to_body(p_world, _pose["height"], _pose["pitch_rad"])
 
