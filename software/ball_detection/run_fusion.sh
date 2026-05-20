@@ -20,17 +20,30 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
 # ── conda env ───────────────────────────────────────────────────────────────
-if ! command -v conda >/dev/null 2>&1; then
-    if [ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]; then
-        source "$HOME/miniconda3/etc/profile.d/conda.sh"
-    elif [ -f "$HOME/anaconda3/etc/profile.d/conda.sh" ]; then
-        source "$HOME/anaconda3/etc/profile.d/conda.sh"
-    fi
-fi
-conda activate catchball 2>/dev/null || {
-    echo "[ERROR] cannot activate conda env 'catchball'" >&2
+# Always source conda.sh — in non-interactive shells the user's .bashrc-defined
+# `conda` shell function isn't inherited, so `conda activate` would fail with
+# "shell not properly initialised".
+CONDA_SH=""
+for _root in "${CONDA_PREFIX_1:-}" "${CONDA_PREFIX:-}" \
+             "$HOME/miniconda3" "$HOME/anaconda3" \
+             "/opt/miniconda3" "/opt/anaconda3" "/opt/conda"; do
+    [ -n "$_root" ] && [ -f "$_root/etc/profile.d/conda.sh" ] && \
+        { CONDA_SH="$_root/etc/profile.d/conda.sh"; break; }
+done
+if [ -z "$CONDA_SH" ]; then
+    echo "[ERROR] cannot find conda.sh — set CONDA_PREFIX or install miniconda" >&2
     exit 1
-}
+fi
+# shellcheck disable=SC1090
+source "$CONDA_SH"
+
+if ! conda activate catchball; then
+    echo "[ERROR] cannot activate conda env 'catchball'" >&2
+    echo "[HINT]  available envs:" >&2
+    conda env list 2>&1 | sed -n '/^#/!p' >&2 || true
+    exit 1
+fi
+echo "[run_fusion] using env: $CONDA_DEFAULT_ENV  ($(which python))"
 
 FUSION_PORT="${FUSION_PORT:-5570}"
 MONITOR_PORT="${MONITOR_PORT:-8080}"
@@ -38,8 +51,11 @@ LOGS=/tmp/fusion-logs
 mkdir -p "$LOGS"
 
 PIDS=()
+_CLEANED=0
 
 cleanup() {
+    [ "$_CLEANED" = 1 ] && return
+    _CLEANED=1
     echo
     echo "[run_fusion] shutting down..."
     for pid in "${PIDS[@]:-}"; do
@@ -49,7 +65,6 @@ cleanup() {
     pkill -P $$ 2>/dev/null
     sleep 0.5
     echo "[run_fusion] done."
-    exit 0
 }
 trap cleanup INT TERM EXIT
 
