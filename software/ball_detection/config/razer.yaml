@@ -1,0 +1,72 @@
+# razer.yaml — Razer Kiyo X (1080p@60 USB UVC)
+#
+# 用作 fusion 的第二路相机。viewer/录制/web 全关——这些工作交给 fusion.py 来做。
+#
+# 用法 (跟 AONI 一起跑融合):
+#   终端 1: python fusion.py --port 5570
+#   终端 2: python ball_detection.py --config config/webcam.yaml  (AONI, 主可视)
+#   终端 3: python ball_detection.py --config config/razer.yaml   (Razer, headless)
+#
+# ⚠ 内参未标定 — 下面 fx/fy 用 Razer Kiyo X 标称 81° HFOV 反推 (~1184)
+# fx ≈ width / (2·tan(HFOV/2)) = 1920 / (2·tan(40.5°)) ≈ 1126
+# 想拿到准确距离请跑: python calibrate_intrinsics.py --device 8 --width 1920 --height 1080
+
+camera:
+  backend: webcam
+  id:      razer            # broadcast 在 fusion 包里的 cam_id
+  device:  8                # /dev/video8 (Razer Kiyo X)
+  fourcc:  MJPG
+  fps:     60
+  intrinsics:
+    fx:  1126.0    # ≈ 1920 / (2·tan(40.5°))，标称 81° HFOV
+    fy:  1126.0
+    ppx: 960.0
+    ppy: 540.0
+    dist: [0.0, 0.0, 0.0, 0.0, 0.0]
+
+width:  1920
+height: 1080
+
+# ── 地面坐标系 — 必须跟 AONI 共用同一个 AprilTag ───────────────────────────────
+camera_height: 0.5
+camera_pitch:  -10.0
+
+tag_family: tag36h11
+tag_ids:    [0, 1, 2, 3]
+tag_size_m: 0.15
+
+# ── 检测 ──────────────────────────────────────────────────────────────────────
+detector: hsv
+
+h_low:  25
+h_high: 80
+s_min:  75
+v_min:  140
+
+motion: false
+mog2_threshold: 50
+min_radius_px:  3
+circularity:    0.55
+
+# ── 物理参数 (与 webcam.yaml 一致，融合后由 fusion.py 用) ──────────────────────
+coeff_drag: 0.47
+rest_x: 0.75
+rest_y: 0.75
+rest_z: 0.65
+
+# ── viewer / 录制全关 ─────────────────────────────────────────────────────────
+viz:       false
+show_mask: false
+traj:      false
+
+record:    false
+save_traj: false
+
+viz3d:        false
+webview:      false
+mjpeg_port:   0
+port_offset:  100      # 避免跟 AONI 实例端口冲突 (fusion_port 不会被 offset)
+
+# ── 融合广播 ──────────────────────────────────────────────────────────────────
+fusion_host: 127.0.0.1
+fusion_port: 5570

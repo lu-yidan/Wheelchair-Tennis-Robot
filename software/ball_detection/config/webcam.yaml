@@ -15,6 +15,7 @@
 # ── 相机后端 ───────────────────────────────────────────────────────────────────
 camera:
   backend: webcam
+  id:      aoni       # broadcast 在 fusion 包里的 cam_id
   device:  2          # /dev/video2 (AONI 2K QHD); 字符串路径或 RTSP URL 也可
   fourcc:  MJPG       # MJPG → 高帧率 (USB UVC 默认)；YUYV 通常被限制在 30fps
   fps:     60
@@ -84,3 +85,7 @@ ctrl_port:      5566
 webview:        true
 webview_port:   5567
 mjpeg_port:     5568
+
+# ── 融合广播 (与 razer.yaml 共享同一个 fusion_port; tag_id 必须一致) ──────────
+fusion_host: 127.0.0.1
+fusion_port: 5570

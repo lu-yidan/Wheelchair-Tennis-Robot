@@ -572,6 +572,14 @@ def _load_config(path):
         out["_camera_section"] = dict(cfg["camera"])
         if "backend" in cfg["camera"]:
             out["camera_backend"] = str(cfg["camera"]["backend"])
+        if "id" in cfg["camera"]:
+            out["cam_id"] = str(cfg["camera"]["id"])
+
+    # Multi-camera fusion broadcasting
+    _get("cam_id",       str, "cam_id")
+    _get("fusion_host",  str, "fusion_host")
+    _get("fusion_port",  int, "fusion_port")
+    _get("port_offset",  int, "port_offset")
 
     # Trajectory recording: false→"", true→"logs/", "path.json"→"path.json"
     if "save_traj" in cfg:
@@ -666,8 +674,25 @@ def main():
                         help="save EKF trajectory to JSON for rest calibration. "
                              "Pass a directory to auto-name: --save-traj logs/ "
                              "→ logs/traj_YYYYMMDD_HHMMSS.json")
+    # ── Multi-camera fusion broadcasting ─────────────────────────────────────
+    parser.add_argument("--cam-id",       default="cam1",
+                        help="this instance's ID, broadcast in fusion packets (default cam1)")
+    parser.add_argument("--fusion-host",  default="127.0.0.1",
+                        help="UDP host for fusion.py (default 127.0.0.1)")
+    parser.add_argument("--fusion-port",  type=int, default=0,
+                        help="UDP port for fusion.py (0 = disable broadcasting)")
+    parser.add_argument("--port-offset",  type=int, default=0,
+                        help="offset added to all UDP/HTTP ports — use a different value "
+                             "per instance when running multiple detectors on the same host")
     parser.set_defaults(**_cfg)   # config file values override code defaults
     args = parser.parse_args()    # CLI args override everything
+
+    # Apply port offset so multiple detectors on one host don't collide
+    if args.port_offset:
+        for _p in ("viz3d_port", "ctrl_port", "webview_port", "mjpeg_port"):
+            v = getattr(args, _p, 0)
+            if v > 0:
+                setattr(args, _p, v + args.port_offset)
 
     viz     = not args.no_viz
     hsv_low  = np.array([args.h_low,  args.s_min, args.v_min], dtype=np.uint8)
@@ -694,6 +719,7 @@ def main():
         # roll, yaw, and pitch simultaneously.
         "R_cw":      None,           # 3×3 ndarray, R from solvePnP
         "tvec_flat": None,           # tvec as 1-D (3,) ndarray
+        "tag_id":    -1,             # ID of the tag currently providing calibration (-1 = none)
     }
 
     hsv_high = np.array([args.h_high, 255, 255], dtype=np.uint8)
@@ -715,6 +741,14 @@ def main():
         _webview_sock = _socket_mod.socket(_socket_mod.AF_INET, _socket_mod.SOCK_DGRAM)
         print(f"[INFO] webview UDP → localhost:{args.webview_port}  "
               f"(open http://localhost:5002 after starting webview.py)")
+
+    # Multi-camera fusion: this instance broadcasts per-frame world-frame measurements
+    # to a fusion.py listener that runs a single combined EKF over N detectors.
+    _fusion_sock = None
+    if args.fusion_port > 0:
+        _fusion_sock = _socket_mod.socket(_socket_mod.AF_INET, _socket_mod.SOCK_DGRAM)
+        print(f"[INFO] fusion UDP → {args.fusion_host}:{args.fusion_port}  "
+              f"cam_id={args.cam_id}  (start fusion.py on this port)")
 
     # Control listener — receives rest / det updates from viz3d.py and webview.py
     if args.viz3d or args.webview:
@@ -1197,6 +1231,28 @@ def main():
                 p_ekf = _to_world(p_body) if _world_active() else p_body
                 st["ekf"].update(p_ekf, _meas_covariance(depth_fused), t_now)
 
+                # ── Multi-camera fusion broadcast ──────────────────────────────
+                # Send the RAW per-frame measurement (NOT EKF-smoothed) so the
+                # fusion process can run its own EKF across all N sources.
+                # World frame is required (so all cameras agree on the origin).
+                if _fusion_sock is not None and _world_active():
+                    # Isotropic cov estimate from depth-axis variance polynomial
+                    _cov_var = float(_meas_covariance(depth_fused)[0, 0])
+                    _pkt = {
+                        "t":       time.time(),
+                        "cam_id":  args.cam_id,
+                        "pos":     [round(float(v), 4) for v in p_ekf],
+                        "cov":     round(_cov_var, 6),
+                        "depth":   round(float(depth_fused), 3),
+                        "tag_id":  int(_pose["tag_id"]),
+                        "tag_age": int(_pose["age"]),
+                    }
+                    try:
+                        _fusion_sock.sendto(json.dumps(_pkt).encode(),
+                                            (args.fusion_host, args.fusion_port))
+                    except Exception:
+                        pass
+
             pos_ekf = st["ekf"].x[:3].copy() if st["ekf"].initialized else None
             return detected, coasting, pos_ekf, depth_fused
 
@@ -1404,6 +1460,7 @@ def main():
                                 _pose["tvec"]      = _tvec
                                 _pose["R_cw"]      = _R
                                 _pose["tvec_flat"] = _tvec.flatten()
+                                _pose["tag_id"]    = int(ids.flatten()[_best_i])
 
             panels      = []
             term_parts  = []
