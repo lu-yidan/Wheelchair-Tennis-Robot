@@ -1489,7 +1489,10 @@ def main():
                 term_parts.append(
                     f"[{label}:{status}] {p_str} {depth_fused:.2f}m {st['fps'].fps:.0f}fps")
 
-                if viz or args.show_mask or rec_path is not None:
+                # Need annotated panel for any sink: OpenCV window, recording,
+                # webview UDP, or MJPEG server.
+                if (viz or args.show_mask or rec_path is not None
+                        or args.webview or getattr(args, "mjpeg_port", 0) > 0):
                     panels.append(
                         _annotate(color, st, mask, label,
                                   detected, coasting, pos_ekf, depth_fused,
