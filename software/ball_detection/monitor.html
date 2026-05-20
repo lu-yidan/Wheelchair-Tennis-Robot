@@ -4,53 +4,337 @@
 <meta charset="utf-8">
 <title>Ball Detection · Multi-cam Monitor</title>
 <style>
-  body { font-family: monospace; background: #111; color: #eee;
+  :root {
+    --bg: #111; --panel: #1a1a1a; --line: #333;
+    --fg: #eee; --hint: #888; --accent: #6df; --err: #f66;
+    --ball: #f93; --traj: #06f; --bounce: #0f6; --tag: #fc4; --cam: #fa6;
+  }
+  * { box-sizing: border-box; }
+  body { font-family: monospace; background: var(--bg); color: var(--fg);
          margin: 0; padding: 8px; }
-  h1 { font-size: 16px; margin: 0 0 8px; color: #6df; }
-  .grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; }
-  .cam { background: #1a1a1a; padding: 6px; border-radius: 4px; min-height: 200px;
-         display: flex; flex-direction: column; }
-  .cam h2 { margin: 0 0 6px; color: #6df; font-size: 13px; display: flex;
-            justify-content: space-between; }
-  .cam .src { color: #888; font-weight: normal; }
-  .cam .frame { background: #000; border: 1px solid #333;
+  h1 { font-size: 16px; margin: 0 0 8px; color: var(--accent); }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .cam, .card { background: var(--panel); padding: 6px; border-radius: 4px;
+                display: flex; flex-direction: column; }
+  .cam h2, .card h2 { margin: 0 0 6px; color: var(--accent); font-size: 13px;
+                       display: flex; justify-content: space-between; }
+  .src { color: var(--hint); font-weight: normal; }
+  .cam .frame { background: #000; border: 1px solid var(--line);
                 aspect-ratio: 16 / 9; display: flex; align-items: center;
                 justify-content: center; overflow: hidden; }
   .cam img { width: 100%; height: 100%; object-fit: contain; display: block; }
-  .cam .err { color: #f66; padding: 16px; text-align: center; }
-  #status { margin-top: 8px; padding: 8px; background: #1a1a1a;
-            border-radius: 4px; font-size: 12px; color: #ccc; }
-  #status .hint { color: #888; }
+  .cam .err { color: var(--err); padding: 16px; text-align: center; }
+  /* state line */
+  #state { margin-top: 8px; padding: 8px; background: var(--panel);
+           border-radius: 4px; font-size: 13px; line-height: 1.5; }
+  #state .big { font-size: 16px; color: var(--accent); }
+  #state .v { color: #cfc; }
+  #state .src-list { color: var(--hint); font-size: 12px; }
+  #state.stale { background: #311; color: var(--err); }
+  /* canvases */
+  .views { display: grid; grid-template-columns: 1fr 1fr; gap: 8px;
+           margin-top: 8px; }
+  .card canvas { display: block; width: 100%; background: #000;
+                 border: 1px solid var(--line); border-radius: 2px; }
+  .legend { font-size: 11px; color: var(--hint); margin-top: 4px; }
+  .legend .sw { display: inline-block; width: 8px; height: 8px;
+                vertical-align: middle; margin-right: 3px; border-radius: 50%; }
 </style>
 </head>
 <body>
 
 <h1>Ball Detection · Multi-cam Monitor</h1>
 
+<!-- 顶部:两路 MJPEG -->
 <div class="grid">
   <div class="cam">
     <h2>AONI 2K  <span class="src">localhost:5568</span></h2>
     <div class="frame">
       <img src="http://localhost:5568/main"
-           onerror="this.parentNode.innerHTML='&lt;div class=err&gt;AONI MJPEG offline (port 5568)<br>start ball_detection.py with config/webcam.yaml&lt;/div&gt;'">
+           onerror="this.parentNode.innerHTML='<div class=err>AONI MJPEG offline (port 5568)<br>start ball_detection.py with config/webcam.yaml</div>'">
     </div>
   </div>
-
   <div class="cam">
     <h2>Razer Kiyo X  <span class="src">localhost:5668</span></h2>
     <div class="frame">
       <img src="http://localhost:5668/main"
-           onerror="this.parentNode.innerHTML='&lt;div class=err&gt;Razer MJPEG offline (port 5668)<br>start ball_detection.py with config/razer.yaml&lt;/div&gt;'">
+           onerror="this.parentNode.innerHTML='<div class=err>Razer MJPEG offline (port 5668)<br>start ball_detection.py with config/razer.yaml</div>'">
     </div>
   </div>
 </div>
 
-<div id="status">
-  <strong>FUSED EKF</strong> — see the fusion.py terminal for live coords.
-  <br><span class="hint">tail -f /tmp/fusion-logs/fusion.log</span>
-  <br><br>
-  <strong>设备</strong> — 改了相机或端口? 编辑 monitor.html 顶部的 &lt;img&gt; src 即可。
+<!-- FUSED 状态条 -->
+<div id="state">
+  <div class="big" id="state-pos">FUSED (waiting for fusion.py state…)</div>
+  <div class="v" id="state-vel"></div>
+  <div class="src-list" id="state-src">(no sources yet)</div>
 </div>
+
+<!-- 两个 canvas -->
+<div class="views">
+  <div class="card">
+    <h2>Top view (X-Y, world frame, looking down)</h2>
+    <canvas id="cv-top" width="500" height="500"></canvas>
+    <div class="legend">
+      <span class="sw" style="background:var(--tag)"></span>tag
+      &nbsp;<span class="sw" style="background:var(--cam)"></span>camera
+      &nbsp;<span class="sw" style="background:var(--ball)"></span>ball
+      &nbsp;<span style="color:var(--traj)">━</span>predicted trajectory
+      &nbsp;<span class="sw" style="background:var(--bounce)"></span>bounce point
+    </div>
+  </div>
+  <div class="card">
+    <h2>Side view (X-Z)</h2>
+    <canvas id="cv-side" width="500" height="500"></canvas>
+    <div class="legend">Z up · ground line at Z=0</div>
+  </div>
+</div>
+
+<script>
+"use strict";
+
+// ── State store ─────────────────────────────────────────────────────────────
+const S = {
+  lastT: 0,       // last server time we received
+  ball: null,     // [x,y,z]
+  vel: null,      // [vx,vy,vz]
+  traj: [],       // [[x,y,z],...]
+  bounces: [],    // [[x,y,z],...]
+  ballHist: [],   // last N fused positions (drawn as trail)
+  sources: {},    // cam_id -> {fps, depth, tag_id, tag_age, drop_pct}
+  stale: true,
+  tags: window.TAG_WORLD_MAP || [],   // optional — populated below
+};
+
+// 内置 4 张 tag (跟 config/tag_world_map.yaml 默认布局一致). 若 yaml 修改, 这里也手动改一下.
+S.tags = [
+  {id: 0, pos: [ 0.6,  0.0, 0.0]},
+  {id: 1, pos: [-0.6,  0.0, 0.0]},
+  {id: 2, pos: [ 0.0,  0.6, 0.0]},
+  {id: 3, pos: [ 0.0, -0.6, 0.0]},
+];
+
+// ── SSE subscribe ───────────────────────────────────────────────────────────
+const es = new EventSource("/events");
+es.onmessage = (ev) => {
+  let pkt;
+  try { pkt = JSON.parse(ev.data); } catch { return; }
+  applyState(pkt);
+};
+es.onerror = () => {
+  // EventSource auto-reconnects; just mark stale
+  document.getElementById("state").classList.add("stale");
+};
+
+function applyState(pkt) {
+  S.lastT = pkt.t || (Date.now() / 1000);
+  const F = pkt.FUSED || {};
+  S.ball     = F.ball     || S.ball;
+  S.vel      = F.vel      || S.vel;
+  S.traj     = F.traj     || [];
+  S.bounces  = F.bounces  || [];
+
+  if (S.ball) {
+    S.ballHist.push(S.ball);
+    if (S.ballHist.length > 80) S.ballHist.shift();
+  }
+
+  // collect per-source stats: every cam_id ≠ "FUSED" found in pkt
+  const detectors = pkt.detectors || [];
+  for (const id of detectors) {
+    if (id === "FUSED") continue;
+    if (pkt[id]) {
+      S.sources[id] = pkt[id];      // detector publishes its own block; reuse if present
+    }
+  }
+  S.stale = false;
+  document.getElementById("state").classList.remove("stale");
+  renderText();
+}
+
+// ── Text renderer ───────────────────────────────────────────────────────────
+function fmt(n, d = 2) {
+  if (n === null || n === undefined || Number.isNaN(n)) return "—";
+  const s = n.toFixed(d);
+  return n >= 0 ? "+" + s : s;
+}
+
+function renderText() {
+  const pe = document.getElementById("state-pos");
+  const ve = document.getElementById("state-vel");
+  const se = document.getElementById("state-src");
+  if (S.ball) {
+    pe.textContent = `FUSED  (${fmt(S.ball[0])}, ${fmt(S.ball[1])}, ${fmt(S.ball[2])}) m`;
+  } else {
+    pe.textContent = "FUSED  (no detection yet)";
+  }
+  if (S.vel) {
+    const spd = Math.hypot(...S.vel);
+    ve.textContent = `vel  (${fmt(S.vel[0])}, ${fmt(S.vel[1])}, ${fmt(S.vel[2])}) m/s  →  ${spd.toFixed(2)} m/s`;
+  } else { ve.textContent = ""; }
+  const ks = Object.keys(S.sources);
+  se.textContent = ks.length
+    ? "sources: " + ks.map(k => `[${k}]`).join(" ")
+    : "(no source-attributed packets — fusion may be in EKF-only mode)";
+}
+
+// ── Canvas drawing ──────────────────────────────────────────────────────────
+function drawTop() {
+  const cv = document.getElementById("cv-top");
+  const ctx = cv.getContext("2d");
+  const W = cv.width, H = cv.height;
+  const SCALE = 60;                         // px per metre  → ±4 m visible
+  const cx = W / 2, cy = H / 2;
+  const toX = (x) => cx + x * SCALE;
+  const toY = (y) => cy - y * SCALE;        // world +Y → screen up
+
+  ctx.fillStyle = "#000"; ctx.fillRect(0, 0, W, H);
+
+  // grid
+  ctx.strokeStyle = "#222"; ctx.lineWidth = 1;
+  for (let i = -6; i <= 6; i++) {
+    const m = i * 0.5;
+    ctx.beginPath();
+    ctx.moveTo(toX(m), 0); ctx.lineTo(toX(m), H);
+    ctx.moveTo(0, toY(m)); ctx.lineTo(W, toY(m));
+    ctx.stroke();
+  }
+  // origin axes
+  ctx.strokeStyle = "#444"; ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  ctx.moveTo(toX(0), 0); ctx.lineTo(toX(0), H);
+  ctx.moveTo(0, toY(0)); ctx.lineTo(W, toY(0));
+  ctx.stroke();
+  // axis labels
+  ctx.fillStyle = "#888"; ctx.font = "11px monospace";
+  ctx.fillText("+X", W - 18, cy + 12);
+  ctx.fillText("+Y", cx + 6, 12);
+
+  // tags
+  ctx.fillStyle = "#fc4";
+  for (const t of S.tags) {
+    const p = [toX(t.pos[0]), toY(t.pos[1])];
+    ctx.fillRect(p[0] - 4, p[1] - 4, 8, 8);
+    ctx.fillText(`tag ${t.id}`, p[0] + 6, p[1] + 3);
+  }
+
+  // ball history trail
+  for (let i = 0; i < S.ballHist.length; i++) {
+    const t = i / Math.max(S.ballHist.length - 1, 1);
+    const a = 0.2 + t * 0.7;
+    ctx.fillStyle = `rgba(255, 153, 51, ${a})`;
+    const p = S.ballHist[i];
+    ctx.beginPath();
+    ctx.arc(toX(p[0]), toY(p[1]), 2 + t * 2, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  // predicted trajectory
+  if (S.traj && S.traj.length > 1) {
+    ctx.strokeStyle = "#06f"; ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.moveTo(toX(S.traj[0][0]), toY(S.traj[0][1]));
+    for (let i = 1; i < S.traj.length; i++)
+      ctx.lineTo(toX(S.traj[i][0]), toY(S.traj[i][1]));
+    ctx.stroke();
+  }
+  // bounce markers
+  ctx.fillStyle = "#0f6";
+  for (const b of (S.bounces || [])) {
+    ctx.beginPath();
+    ctx.arc(toX(b[0]), toY(b[1]), 5, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  // current ball position
+  if (S.ball) {
+    ctx.fillStyle = "#f93";
+    ctx.beginPath();
+    ctx.arc(toX(S.ball[0]), toY(S.ball[1]), 6, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle = "#fff"; ctx.lineWidth = 1.5;
+    ctx.stroke();
+  }
+}
+
+function drawSide() {
+  const cv = document.getElementById("cv-side");
+  const ctx = cv.getContext("2d");
+  const W = cv.width, H = cv.height;
+  const SCALE = 60;
+  const cx = W / 2, cy = H - 80;            // ground line near bottom
+  const toX = (x) => cx + x * SCALE;
+  const toZ = (z) => cy - z * SCALE;
+
+  ctx.fillStyle = "#000"; ctx.fillRect(0, 0, W, H);
+
+  ctx.strokeStyle = "#222"; ctx.lineWidth = 1;
+  for (let i = -6; i <= 6; i++) {
+    const m = i * 0.5;
+    ctx.beginPath();
+    ctx.moveTo(toX(m), 0); ctx.lineTo(toX(m), H);
+    ctx.moveTo(0, toZ(m)); ctx.lineTo(W, toZ(m));
+    ctx.stroke();
+  }
+  // ground line
+  ctx.strokeStyle = "#070"; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(0, cy); ctx.lineTo(W, cy); ctx.stroke();
+  ctx.fillStyle = "#888"; ctx.font = "11px monospace";
+  ctx.fillText("ground (Z=0)", 8, cy - 4);
+
+  // tags at z=0
+  ctx.fillStyle = "#fc4";
+  for (const t of S.tags) {
+    ctx.fillRect(toX(t.pos[0]) - 3, toZ(0) - 3, 6, 6);
+  }
+
+  // ball history trail
+  for (let i = 0; i < S.ballHist.length; i++) {
+    const t = i / Math.max(S.ballHist.length - 1, 1);
+    ctx.fillStyle = `rgba(255, 153, 51, ${0.2 + t * 0.7})`;
+    const p = S.ballHist[i];
+    ctx.beginPath();
+    ctx.arc(toX(p[0]), toZ(p[2]), 2 + t * 2, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  // trajectory
+  if (S.traj && S.traj.length > 1) {
+    ctx.strokeStyle = "#06f"; ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.moveTo(toX(S.traj[0][0]), toZ(S.traj[0][2]));
+    for (let i = 1; i < S.traj.length; i++)
+      ctx.lineTo(toX(S.traj[i][0]), toZ(S.traj[i][2]));
+    ctx.stroke();
+  }
+  ctx.fillStyle = "#0f6";
+  for (const b of (S.bounces || [])) {
+    ctx.beginPath(); ctx.arc(toX(b[0]), toZ(b[2]), 5, 0, Math.PI * 2); ctx.fill();
+  }
+
+  // ball
+  if (S.ball) {
+    ctx.fillStyle = "#f93";
+    ctx.beginPath();
+    ctx.arc(toX(S.ball[0]), toZ(S.ball[2]), 6, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle = "#fff"; ctx.lineWidth = 1.5;
+    ctx.stroke();
+  }
+}
+
+// 20 Hz redraw — independent of incoming packet rate so the page feels smooth
+setInterval(() => { drawTop(); drawSide(); }, 50);
+
+// stale-check: if no packet in 1.5 s mark visually
+setInterval(() => {
+  const now = Date.now() / 1000;
+  if (now - S.lastT > 1.5) {
+    document.getElementById("state").classList.add("stale");
+  }
+}, 500);
+
+</script>
 
 </body>
 </html>

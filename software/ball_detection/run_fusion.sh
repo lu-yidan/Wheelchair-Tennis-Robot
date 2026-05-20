@@ -47,6 +47,7 @@ echo "[run_fusion] using env: $CONDA_DEFAULT_ENV  ($(which python))"
 
 FUSION_PORT="${FUSION_PORT:-5570}"
 MONITOR_PORT="${MONITOR_PORT:-8080}"
+WEBVIEW_PORT="${WEBVIEW_PORT:-5571}"     # fusion → monitor SSE relay channel
 LOGS=/tmp/fusion-logs
 mkdir -p "$LOGS"
 
@@ -76,9 +77,10 @@ sleep 0.5
 echo "[run_fusion] fusion port = $FUSION_PORT, monitor port = $MONITOR_PORT"
 echo "[run_fusion] logs → $LOGS/"
 
-# ── 1. fusion ───────────────────────────────────────────────────────────────
+# ── 1. fusion (broadcasts state to monitor.py via webview-port) ─────────────
 echo "[run_fusion] starting fusion..."
-python fusion.py --port "$FUSION_PORT" > "$LOGS/fusion.log" 2>&1 &
+python fusion.py --port "$FUSION_PORT" --webview-port "$WEBVIEW_PORT" \
+    > "$LOGS/fusion.log" 2>&1 &
 PIDS+=($!)
 sleep 1
 
@@ -96,10 +98,10 @@ python ball_detection.py --config config/razer.yaml --no-viz \
 PIDS+=($!)
 sleep 2
 
-# ── 4. monitor 页面 ─────────────────────────────────────────────────────────
-echo "[run_fusion] serving monitor.html on http://localhost:${MONITOR_PORT}/monitor.html"
-python -m http.server "$MONITOR_PORT" --directory "$SCRIPT_DIR" \
-    > "$LOGS/http.log" 2>&1 &
+# ── 4. monitor.py — HTTP + SSE relay (replaces python -m http.server) ───────
+echo "[run_fusion] serving monitor.py on http://localhost:${MONITOR_PORT}/monitor.html"
+python monitor.py --http-port "$MONITOR_PORT" --udp-port "$WEBVIEW_PORT" \
+    --dir "$SCRIPT_DIR" > "$LOGS/monitor.log" 2>&1 &
 PIDS+=($!)
 sleep 1
 
@@ -108,9 +110,11 @@ cat <<EOF
 
 ═══════════════════════════════════════════════════════════════════════
   网页:    http://localhost:${MONITOR_PORT}/monitor.html
-  融合状态: tail -f $LOGS/fusion.log
+             ← 球的位置 + 预测弹道实时显示 (SSE)
+  融合数字: tail -f $LOGS/fusion.log
   AONI 日志: tail -f $LOGS/aoni.log
   Razer 日志: tail -f $LOGS/razer.log
+  monitor 日志: tail -f $LOGS/monitor.log
   按 Ctrl+C 停止全部
 ═══════════════════════════════════════════════════════════════════════
 
