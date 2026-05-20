@@ -17,12 +17,13 @@ camera:
   device:  8                # /dev/video8 (Razer Kiyo X)
   fourcc:  MJPG
   fps:     60
+  # Razer Kiyo X @1920×1080 标定结果 (calibrate_intrinsics.py, 79 张, 0.58px RMS)
   intrinsics:
-    fx:  1126.0    # ≈ 1920 / (2·tan(40.5°))，标称 81° HFOV
-    fy:  1126.0
-    ppx: 960.0
-    ppy: 540.0
-    dist: [0.0, 0.0, 0.0, 0.0, 0.0]
+    fx:  1288.77
+    fy:  1296.09
+    ppx: 964.42
+    ppy: 500.32
+    dist: [0.103269, -0.351726, -0.012796, -0.003411, 0.362364]
 
 width:  1920
 height: 1080
