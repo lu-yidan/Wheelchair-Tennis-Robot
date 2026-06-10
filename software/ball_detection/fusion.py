@@ -103,10 +103,11 @@ def main():
 
     # Per-source rolling stats
     stats = {}     # cam_id → {"n_total", "t_first", "t_last", "last_pos", "last_depth", "last_tag"}
-    last_print_t = 0.0
-    print_period = 1.0 / max(args.print_hz, 1.0)
-    last_traj_t  = 0.0
-    cached_traj  = []   # cached EKF rollout for forwarding
+    last_print_t  = 0.0
+    print_period  = 1.0 / max(args.print_hz, 1.0)
+    last_traj_t   = 0.0
+    last_cam_hb_t = 0.0   # cam-position heartbeat when EKF not yet initialized
+    cached_traj   = []   # cached EKF rollout for forwarding
 
     print("[fusion] waiting for packets…")
     try:
@@ -137,6 +138,20 @@ def main():
                 last_traj_t = now
                 _forward(cached_traj, ekf, stats, args, fwd_viz3d, fwd_web)
 
+            # Cam-position heartbeat (5 Hz) when EKF not yet initialized
+            # Lets camera triangles appear in monitor.html before any ball is seen.
+            if fwd_web and not ekf.initialized and now - last_cam_hb_t >= 0.2:
+                last_cam_hb_t = now
+                _cams = {cid: {"pos": s["last_cam_pos"], "look": s["last_cam_look"]}
+                         for cid, s in stats.items() if s.get("last_cam_pos") is not None}
+                if _cams:
+                    try:
+                        fwd_web.sendto(
+                            b"\x00" + json.dumps({"t": now, "detectors": [], "cams": _cams}).encode(),
+                            ("127.0.0.1", args.webview_port))
+                    except Exception:
+                        pass
+
     except KeyboardInterrupt:
         print("\n[fusion] stopped.")
 
@@ -147,45 +162,53 @@ def main():
 
 def _consume(pkt, now, ekf, stats, max_age_ms, require_tag, max_tag_age):
     try:
-        t_pkt  = float(pkt["t"])
-        cam_id = str(pkt["cam_id"])
-        pos    = np.asarray(pkt["pos"], dtype=float)
-        cov    = max(float(pkt.get("cov", 0.05)), 1e-6)
-        tag_id = int(pkt.get("tag_id", -1))
+        t_pkt   = float(pkt["t"])
+        cam_id  = str(pkt["cam_id"])
+        tag_id  = int(pkt.get("tag_id", -1))
         tag_age = int(pkt.get("tag_age", 9999))
     except (KeyError, TypeError, ValueError):
         return
 
     age_ms = (now - t_pkt) * 1000.0
     if abs(age_ms) > max_age_ms:
-        # Clock skew or buffer pile-up; ignore quietly to avoid log flood
         return
 
-    # Per-source bookkeeping — always update stats so we can show "dropping" status
     s = stats.setdefault(cam_id, {
         "n_total": 0, "n_dropped": 0, "t_first": now, "t_last": now,
         "last_pos": None, "last_depth": 0.0, "last_tag": -1, "last_tag_age": 9999,
         "ema_dt": None,
+        "last_cam_pos": None, "last_cam_look": None,
     })
+    s["last_tag"]     = tag_id
+    s["last_tag_age"] = tag_age
+    if "cam_pos" in pkt:
+        s["last_cam_pos"]  = pkt["cam_pos"]
+        s["last_cam_look"] = pkt.get("cam_look")
+
+    # Cam-only heartbeat (no ball measurement) — update pose but skip EKF
+    pos_raw = pkt.get("pos")
+    if pos_raw is None:
+        return
+
+    try:
+        pos = np.asarray(pos_raw, dtype=float)
+        cov = max(float(pkt.get("cov", 0.05)), 1e-6)
+    except (TypeError, ValueError):
+        return
+
+    # Per-source fps bookkeeping (only for ball packets, not heartbeats)
     if s["last_pos"] is not None:
-        # Exponential moving average of inter-arrival period (proxy for fps)
         dt = now - s["t_last"]
         s["ema_dt"] = dt if s["ema_dt"] is None else (0.1 * dt + 0.9 * s["ema_dt"])
     s["n_total"] += 1
-    s["t_last"]  = now
-    s["last_pos"] = pos
+    s["t_last"]   = now
+    s["last_pos"]  = pos
     s["last_depth"] = float(pkt.get("depth", 0.0))
-    s["last_tag"] = tag_id
-    s["last_tag_age"] = tag_age
 
-    # Reject packets that aren't using a fresh AprilTag — they're in a different
-    # world frame than tag-calibrated sources and fusing them causes drift.
     if require_tag and (tag_id < 0 or tag_age > max_tag_age):
         s["n_dropped"] += 1
         return
 
-    # EKF update — isotropic 3×3 measurement noise from the cov scalar.
-    # (Phase 2 idea: receive a full 3×3 in world frame for proper anisotropic fusion.)
     R_meas = np.eye(3) * cov
     ekf.update(pos, R_meas, t_pkt)
 
@@ -239,11 +262,21 @@ def _forward(traj_pts, ekf, stats, args, sock_viz3d, sock_web):
             bounces.append([round(float(v), 4) for v in p])
         last_z = p[2]
 
+    # Collect per-source camera positions for the map view
+    cams = {}
+    for cid, s in stats.items():
+        if s.get("last_cam_pos") is not None:
+            cams[cid] = {
+                "pos":  s["last_cam_pos"],
+                "look": s["last_cam_look"],
+            }
+
     pkt = {
         "t": time.time(),
         "detectors": ["FUSED"],
         "cam": None, "cam_look": None, "tag_age": 0,
         "rest": [round(args.rest_x, 2), round(args.rest_y, 2), round(args.rest_z, 2)],
+        "cams": cams,
         "FUSED": {
             "ball":      [round(float(v), 4) for v in ekf.x[:3]],
             "vel":       [round(float(v), 4) for v in ekf.x[3:]],

@@ -26,6 +26,9 @@ class RealSenseCamera(Camera):
         # rs.align is cheap but optional
         self._align_to_color = bool(ccfg.get("align_depth_to_color", True))
         self._enable_depth   = bool(ccfg.get("enable_depth", True))
+        # Optional serial number — lets two instances run on the same host
+        _sn = ccfg.get("serial", None)
+        self._serial = str(_sn) if _sn is not None else None
 
         self._pipeline = None
         self._align    = None
@@ -39,6 +42,9 @@ class RealSenseCamera(Camera):
         last_err = None
         for c_fps, d_fps in self._normalize_tries():
             cfg = rs.config()
+            if self._serial:
+                cfg.enable_device(self._serial)
+                print(f"[INFO] RealSense selecting SN={self._serial}")
             cfg.enable_stream(rs.stream.color, self._width, self._height,
                               rs.format.bgr8, c_fps)
             if self._enable_depth:

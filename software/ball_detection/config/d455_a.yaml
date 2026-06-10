@@ -1,0 +1,62 @@
+# d455_a.yaml — 双 D455 融合方案：相机 A（SN 260722302887）
+# 配套使用 d455_b.yaml + run_dual_d455.sh
+
+camera:
+  backend: realsense
+  serial: "260722302887"       # 指定序列号，防止与 d455_b 争抢设备
+  id: d455_a                   # cam_id 来源（可被顶层 cam_id 或命令行覆盖）
+  align_depth_to_color: true
+  enable_depth: true
+  fps_tries: [[30, 30]]   # 双相机共用同一 USB 控制器时带宽不够两路同跑 60fps
+
+width:  848
+height: 480
+
+camera_height: 0.5
+camera_pitch:  -10.0
+
+tag_family: tag36h11
+tag_ids:    [0, 1, 2, 3]
+tag_size_m: 0.15
+
+detector: hsv
+
+h_low:  25
+h_high: 80
+s_min:  75
+v_min:  140
+
+motion: true
+mog2_threshold: 50
+min_radius_px:  3
+circularity:    0.55
+
+yolo_model: models/yolov8n.pt
+yolo_imgsz: 480
+yolo_conf:  0.3
+
+# D455 传感器深度精度远好于视觉估算，完全信任传感器
+vis_weight: 0.0
+
+coeff_drag: 0.47
+rest_x: 0.75
+rest_y: 0.75
+rest_z: 0.65
+
+viz:       false
+show_mask: false
+traj:      false
+
+record:     false
+record_raw: false
+save_traj:  false
+
+# ── 融合配置 ──────────────────────────────────────────────────────────────────
+# fusion.py 用 --port 5570 启动后，这里 detector 向其发送世界坐标测量值
+cam_id:      d455_a
+fusion_port: 5570
+
+# 端口偏移 = 0：使用默认端口 5565/5566/5567/5568
+port_offset: 0
+viz3d:       false
+webview:     false

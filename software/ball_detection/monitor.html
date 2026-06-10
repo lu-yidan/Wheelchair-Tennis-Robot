@@ -7,7 +7,7 @@
   :root {
     --bg: #111; --panel: #1a1a1a; --line: #333;
     --fg: #eee; --hint: #888; --accent: #6df; --err: #f66;
-    --ball: #f93; --traj: #06f; --bounce: #0f6; --tag: #fc4; --cam: #fa6;
+    --ball: #f60; --traj: #06f; --bounce: #0f6; --tag: #fc4; --cam: #0cf;
   }
   * { box-sizing: border-box; }
   body { font-family: monospace; background: var(--bg); color: var(--fg);
@@ -48,17 +48,17 @@
 <!-- 顶部:两路 MJPEG -->
 <div class="grid">
   <div class="cam">
-    <h2>AONI 2K  <span class="src">localhost:5568</span></h2>
+    <h2>D455 A  <span class="src">SN 260722302887 · localhost:5568</span></h2>
     <div class="frame">
       <img src="http://localhost:5568/main"
-           onerror="this.parentNode.innerHTML='<div class=err>AONI MJPEG offline (port 5568)<br>start ball_detection.py with config/webcam.yaml</div>'">
+           onerror="this.parentNode.innerHTML='<div class=err>D455 A MJPEG offline (port 5568)<br>start ball_detection.py with config/d455_a.yaml</div>'">
     </div>
   </div>
   <div class="cam">
-    <h2>Razer Kiyo X  <span class="src">localhost:5668</span></h2>
+    <h2>D455 B  <span class="src">SN 152522251463 · localhost:5668</span></h2>
     <div class="frame">
       <img src="http://localhost:5668/main"
-           onerror="this.parentNode.innerHTML='<div class=err>Razer MJPEG offline (port 5668)<br>start ball_detection.py with config/razer.yaml</div>'">
+           onerror="this.parentNode.innerHTML='<div class=err>D455 B MJPEG offline (port 5668)<br>start ball_detection.py with config/d455_b.yaml</div>'">
     </div>
   </div>
 </div>
@@ -77,10 +77,10 @@
     <canvas id="cv-top" width="500" height="500"></canvas>
     <div class="legend">
       <span class="sw" style="background:var(--tag)"></span>tag
-      &nbsp;<span class="sw" style="background:var(--cam)"></span>camera
+      &nbsp;▶<span style="color:var(--cam)">cam</span>
       &nbsp;<span class="sw" style="background:var(--ball)"></span>ball
-      &nbsp;<span style="color:var(--traj)">━</span>predicted trajectory
-      &nbsp;<span class="sw" style="background:var(--bounce)"></span>bounce point
+      &nbsp;<span style="color:var(--traj)">━</span>predicted traj
+      &nbsp;<span class="sw" style="background:var(--bounce)"></span>bounce
     </div>
   </div>
   <div class="card">
@@ -102,16 +102,15 @@ const S = {
   bounces: [],    // [[x,y,z],...]
   ballHist: [],   // last N fused positions (drawn as trail)
   sources: {},    // cam_id -> {fps, depth, tag_id, tag_age, drop_pct}
+  cams: {},       // cam_id -> {pos:[x,y,z], look:[dx,dy,dz]}
   stale: true,
   tags: window.TAG_WORLD_MAP || [],   // optional — populated below
 };
 
-// 内置 4 张 tag (跟 config/tag_world_map.yaml 默认布局一致). 若 yaml 修改, 这里也手动改一下.
+// Tag 位置 = 世界坐标系原点 (0,0,0)，即 solvePnP 以 tag 中心为原点。
+// 只有实际摆放的 tag ID 才需要列在这里；多 tag 时需配合 tag_world_map.yaml 手动填入各 tag 的世界坐标。
 S.tags = [
-  {id: 0, pos: [ 0.6,  0.0, 0.0]},
-  {id: 1, pos: [-0.6,  0.0, 0.0]},
-  {id: 2, pos: [ 0.0,  0.6, 0.0]},
-  {id: 3, pos: [ 0.0, -0.6, 0.0]},
+  {id: 0, pos: [0.0, 0.0, 0.0]},
 ];
 
 // ── SSE subscribe ───────────────────────────────────────────────────────────
@@ -139,12 +138,16 @@ function applyState(pkt) {
     if (S.ballHist.length > 80) S.ballHist.shift();
   }
 
-  // collect per-source stats: every cam_id ≠ "FUSED" found in pkt
+  // collect per-source stats
   const detectors = pkt.detectors || [];
   for (const id of detectors) {
     if (id === "FUSED") continue;
-    if (pkt[id]) {
-      S.sources[id] = pkt[id];      // detector publishes its own block; reuse if present
+    if (pkt[id]) S.sources[id] = pkt[id];
+  }
+  // camera positions from fusion
+  if (pkt.cams) {
+    for (const [id, c] of Object.entries(pkt.cams)) {
+      S.cams[id] = c;
     }
   }
   S.stale = false;
@@ -218,11 +221,39 @@ function drawTop() {
     ctx.fillText(`tag ${t.id}`, p[0] + 6, p[1] + 3);
   }
 
+  // cameras (cyan triangle pointing in XY look direction)
+  const CAM_COLORS = ["#0cf", "#f0c", "#fc0", "#0fc"];
+  let ci = 0;
+  for (const [id, c] of Object.entries(S.cams)) {
+    const color = CAM_COLORS[ci++ % CAM_COLORS.length];
+    const px = toX(c.pos[0]), py = toY(c.pos[1]);
+    // look direction projected onto XY plane
+    const lx = c.look ? c.look[0] : 0;
+    const ly = c.look ? c.look[1] : 0;
+    const len = Math.hypot(lx, ly) || 1;
+    const angle = Math.atan2(-ly, lx);   // -ly because screen Y is flipped
+    // draw filled triangle
+    ctx.save();
+    ctx.translate(px, py);
+    ctx.rotate(angle);
+    ctx.fillStyle = color;
+    ctx.beginPath();
+    ctx.moveTo(14, 0);
+    ctx.lineTo(-8, -7);
+    ctx.lineTo(-8,  7);
+    ctx.closePath();
+    ctx.fill();
+    ctx.restore();
+    // label
+    ctx.fillStyle = color;
+    ctx.font = "11px monospace";
+    ctx.fillText(id, px + 16, py - 8);
+  }
+
   // ball history trail
   for (let i = 0; i < S.ballHist.length; i++) {
     const t = i / Math.max(S.ballHist.length - 1, 1);
-    const a = 0.2 + t * 0.7;
-    ctx.fillStyle = `rgba(255, 153, 51, ${a})`;
+    ctx.fillStyle = `rgba(255, 100, 0, ${0.2 + t * 0.7})`;
     const p = S.ballHist[i];
     ctx.beginPath();
     ctx.arc(toX(p[0]), toY(p[1]), 2 + t * 2, 0, Math.PI * 2);
@@ -288,10 +319,35 @@ function drawSide() {
     ctx.fillRect(toX(t.pos[0]) - 3, toZ(0) - 3, 6, 6);
   }
 
+  // cameras (side view: triangle in XZ plane)
+  const CAM_COLORS2 = ["#0cf", "#f0c", "#fc0", "#0fc"];
+  let ci2 = 0;
+  for (const [id, c] of Object.entries(S.cams)) {
+    const color = CAM_COLORS2[ci2++ % CAM_COLORS2.length];
+    const px = toX(c.pos[0]), pz = toZ(c.pos[2]);
+    const lx = c.look ? c.look[0] : 0;
+    const lz = c.look ? c.look[2] : 0;
+    const angle = Math.atan2(-lz, lx);   // -lz because screen Y is flipped
+    ctx.save();
+    ctx.translate(px, pz);
+    ctx.rotate(angle);
+    ctx.fillStyle = color;
+    ctx.beginPath();
+    ctx.moveTo(14, 0);
+    ctx.lineTo(-8, -7);
+    ctx.lineTo(-8,  7);
+    ctx.closePath();
+    ctx.fill();
+    ctx.restore();
+    ctx.fillStyle = color;
+    ctx.font = "11px monospace";
+    ctx.fillText(id, px + 16, pz - 8);
+  }
+
   // ball history trail
   for (let i = 0; i < S.ballHist.length; i++) {
     const t = i / Math.max(S.ballHist.length - 1, 1);
-    ctx.fillStyle = `rgba(255, 153, 51, ${0.2 + t * 0.7})`;
+    ctx.fillStyle = `rgba(255, 100, 0, ${0.2 + t * 0.7})`;
     const p = S.ballHist[i];
     ctx.beginPath();
     ctx.arc(toX(p[0]), toZ(p[2]), 2 + t * 2, 0, Math.PI * 2);

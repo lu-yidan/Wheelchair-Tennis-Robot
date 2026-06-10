@@ -535,6 +535,9 @@ def _load_config(path):
     _get("min_radius_px",  int,   "min_radius")
     _get("circularity",    float, "circularity")
 
+    # Depth fusion weight
+    _get("vis_weight",     float, "vis_weight")
+
     # Visualisation — YAML positive, argparse negated
     if "viz" in cfg:
         out["no_viz"] = not bool(cfg["viz"])
@@ -636,6 +639,8 @@ def main():
                         help="YOLO model path (auto-downloaded on first use)")
     parser.add_argument("--imgsz",        type=int, default=480, help="YOLO inference size")
     parser.add_argument("--conf",         type=float, default=0.3, help="YOLO confidence threshold")
+    parser.add_argument("--vis-weight",   type=float, default=VIS_WEIGHT,
+                        help="depth fusion weight: 1.0=visual-only  0.0=sensor-only  0.5=equal (default)")
     parser.add_argument("--record",       metavar="FILE", nargs="?", const="",
                         help="record annotated video; omit FILE for auto timestamp name")
     parser.add_argument("--record-raw",   action="store_true",
@@ -1022,7 +1027,8 @@ def main():
             label: {"cx": None, "cy": None, "r": None, "miss": 0,
                     "ekf": PhysicsEKF(coeff_drag=args.coeff_drag),
                     "fps": _FPS(),
-                    "traj_pts": []}   # cached rollout — computed once per frame
+                    "traj_pts": [],   # cached rollout — computed once per frame
+                    "px_hist": []}    # raw detection pixels (cx,cy) for trail overlay
             for label, _ in _detectors
         }
 
@@ -1270,7 +1276,7 @@ def main():
             sensor_ok = DEPTH_MIN < depth_sensor < DEPTH_MAX
             if vis_ok and sensor_ok:
                 ratio = depth_vis / depth_sensor
-                depth_fused = (VIS_WEIGHT * depth_vis + (1 - VIS_WEIGHT) * depth_sensor
+                depth_fused = (args.vis_weight * depth_vis + (1 - args.vis_weight) * depth_sensor
                                if 0.5 < ratio < 2.0 else depth_vis)
             elif vis_ok:
                 depth_fused = depth_vis
@@ -1301,6 +1307,10 @@ def main():
                         "depth":   round(float(depth_fused), 3),
                         "tag_id":  int(_pose["tag_id"]),
                         "tag_age": int(_pose["age"]),
+                        "cam_pos":  [round(float(v), 4) for v in
+                                     -(_pose["R_cw"].T @ _pose["tvec_flat"])],
+                        "cam_look": [round(float(v), 4) for v in
+                                     _pose["R_cw"].T @ np.array([0., 0., 1.])],
                     }
                     try:
                         _fusion_sock.sendto(json.dumps(_pkt).encode(),
@@ -1376,17 +1386,14 @@ def main():
                             (20, vis.shape[0] // 2),
                             cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 2)
 
-            # Historical trail — past 3-D positions projected onto image
-            if hist and _world_active():
-                n = len(hist)
+            # Historical trail — raw detection pixels (no reprojection, exact alignment)
+            px_hist = st.get("px_hist", [])
+            if px_hist:
+                n = len(px_hist)
                 prev_px = None
-                for i, h_pt in enumerate(hist):
+                for i, (hx, hy) in enumerate(px_hist):
                     t = i / max(n - 1, 1)          # 0 = oldest, 1 = newest
-                    pt_body = _to_body(h_pt)
-                    px = _body_to_pixel(pt_body, intr)
-                    if px is None:
-                        prev_px = None
-                        continue
+                    px = (int(hx), int(hy))
                     # BGR fade: dark orange → bright orange
                     col = (0, int(30 + 135 * t), int(80 + 175 * t))
                     cv2.circle(vis, px, max(2, int(2 + 2 * t)), col, -1)
@@ -1460,7 +1467,8 @@ def main():
 
             return vis
 
-        _court_last_t = 0.0   # throttle court_view rendering to 10 fps
+        _court_last_t  = 0.0   # throttle court_view rendering to 10 fps
+        _cam_hb_last_t = 0.0   # throttle cam-pos heartbeat to fusion
 
         # ── Main loop ─────────────────────────────────────────────────────────
         while not stop_flag.is_set():
@@ -1516,6 +1524,26 @@ def main():
                                 _pose["R_cw"]      = _R
                                 _pose["tvec_flat"] = _tvec.flatten()
                                 _pose["tag_id"]    = int(ids.flatten()[_best_i])
+
+            # ── Cam-position heartbeat → fusion (10 Hz, no ball required) ──────
+            # Ensures camera triangles appear in monitor.html even without a ball.
+            if _fusion_sock is not None and _pose["R_cw"] is not None:
+                _wall = time.time()
+                if _wall - _cam_hb_last_t >= 0.10:
+                    _cam_hb_last_t = _wall
+                    try:
+                        _fusion_sock.sendto(json.dumps({
+                            "t":        _wall,
+                            "cam_id":   args.cam_id,
+                            "tag_id":   int(_pose["tag_id"]),
+                            "tag_age":  int(_pose["age"]),
+                            "cam_pos":  [round(float(v), 4) for v in
+                                         -(_pose["R_cw"].T @ _pose["tvec_flat"])],
+                            "cam_look": [round(float(v), 4) for v in
+                                          _pose["R_cw"].T @ np.array([0., 0., 1.])],
+                        }).encode(), (args.fusion_host, args.fusion_port))
+                    except Exception:
+                        pass
 
             panels      = []
             term_parts  = []
@@ -1594,6 +1622,13 @@ def main():
             # Per-detector ball history (for UDP multi-detector selector)
             for _lbl, _ in _detectors:
                 _se = _st[_lbl]["ekf"]
+                _scx = _st[_lbl]["cx"]; _scy = _st[_lbl]["cy"]
+                if _scx is not None and _scy is not None:
+                    _st[_lbl]["px_hist"].append((_scx, _scy))
+                    if len(_st[_lbl]["px_hist"]) > 120:
+                        _st[_lbl]["px_hist"].pop(0)
+                else:
+                    _st[_lbl]["px_hist"].clear()
                 if _world_active() and _se.initialized:
                     _ep2 = _se.x[:3]
                     _hist[_lbl].append((round(float(_ep2[0]),4),
