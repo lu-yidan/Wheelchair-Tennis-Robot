@@ -17,7 +17,7 @@ camera_pitch:  -10.0
 
 tag_family: tag36h11
 tag_ids:    [0, 1, 2, 3]
-tag_size_m: 0.15
+tag_size_m: 0.25
 
 detector: hsv
 
@@ -45,7 +45,7 @@ rest_z: 0.65
 
 viz:       false
 show_mask: false
-traj:      false
+traj:      true
 
 record:     false
 record_raw: false
