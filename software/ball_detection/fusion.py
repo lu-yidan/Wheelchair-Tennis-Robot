@@ -82,6 +82,12 @@ def main():
     ap.add_argument("--max-tag-age", type=int, default=30,
                     help="drop packets when source's tag_age > this many frames "
                          "(stale calibration; default 30 = ~1s @30fps)")
+    ap.add_argument("--outlier-m", type=float, default=2.0,
+                    help="reject measurements farther than this from current EKF state (m); "
+                         "0 = disabled (default 2.0)")
+    ap.add_argument("--reset-sec", type=float, default=3.0,
+                    help="reset EKF after this many seconds without a valid measurement; "
+                         "0 = never reset (default 3.0)")
     ap.add_argument("--print-hz",   type=float, default=20.0,
                     help="terminal status refresh rate (default 20)")
     # Optional forwarding to existing viewers (same ports as ball_detection)
@@ -156,9 +162,18 @@ def main():
 
             if pkt is not None:
                 accepted = _consume(pkt, now, ekf, stats, args.max_age_ms,
-                                    args.require_tag, args.max_tag_age)
+                                    args.require_tag, args.max_tag_age,
+                                    args.outlier_m)
                 if accepted:
                     last_accepted_t = now
+
+            # EKF 超时复位：长时间无有效测量说明球已离开视野
+            if (args.reset_sec > 0 and ekf.initialized
+                    and now - last_accepted_t > args.reset_sec):
+                ekf.initialized = False
+                cached_traj = []
+                print(f"\n[fusion] EKF reset — no valid measurement for "
+                      f"{args.reset_sec:.1f}s")
 
             # Throttled terminal status + viewer forwarding
             if now - last_print_t >= print_period:
@@ -199,7 +214,8 @@ def main():
 #  Internals
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _consume(pkt, now, ekf, stats, max_age_ms, require_tag, max_tag_age):
+def _consume(pkt, now, ekf, stats, max_age_ms, require_tag, max_tag_age,
+             outlier_m=2.0):
     """Returns True if a measurement was accepted into the EKF, False otherwise."""
     try:
         t_pkt   = float(pkt["t"])
@@ -248,6 +264,13 @@ def _consume(pkt, now, ekf, stats, max_age_ms, require_tag, max_tag_age):
     if require_tag and (tag_id < 0 or tag_age > max_tag_age):
         s["n_dropped"] += 1
         return False
+
+    # 异常值拒绝：新测量距当前 EKF 状态超过阈值时丢弃
+    if outlier_m > 0 and ekf.initialized:
+        dist = float(np.linalg.norm(pos - ekf.x[:3]))
+        if dist > outlier_m:
+            s["n_dropped"] += 1
+            return False
 
     R_meas = np.eye(3) * cov
     ekf.update(pos, R_meas, t_pkt)
