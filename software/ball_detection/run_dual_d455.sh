@@ -40,6 +40,7 @@ echo "[run_dual_d455] env: $CONDA_DEFAULT_ENV  ($(which python))"
 FUSION_PORT="${FUSION_PORT:-5570}"
 MONITOR_PORT="${MONITOR_PORT:-8080}"
 WEBVIEW_PORT="${WEBVIEW_PORT:-5571}"
+TRAJ_PUB_PORT="${TRAJ_PUB_PORT:-5580}"
 LOGS=/tmp/fusion-logs
 mkdir -p "$LOGS"
 
@@ -68,6 +69,7 @@ echo "[run_dual_d455] fusion port=$FUSION_PORT  monitor port=$MONITOR_PORT"
 
 # ── 1. fusion ───────────────────────────────────────────────────────────────
 python fusion.py --port "$FUSION_PORT" --webview-port "$WEBVIEW_PORT" \
+    --traj-pub-port "$TRAJ_PUB_PORT" \
     > "$LOGS/fusion.log" 2>&1 &
 PIDS+=($!)
 sleep 1
@@ -96,6 +98,7 @@ cat <<EOF
   网页:      http://localhost:${MONITOR_PORT}/monitor.html
   D455 A:   SN 260722302887  MJPEG → http://localhost:5568/main
   D455 B:   SN 152522251463  MJPEG → http://localhost:5668/main
+  轨迹发布:  tcp://<本机IP>:${TRAJ_PUB_PORT}  (ZMQ SUB, 30 Hz, 2s预测)
   融合日志:  tail -f $LOGS/fusion.log
   按 Ctrl+C 停止全部
 ═══════════════════════════════════════════════════════════════════════

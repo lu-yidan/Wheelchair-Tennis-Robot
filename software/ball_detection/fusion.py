@@ -45,6 +45,12 @@ import time
 
 import numpy as np
 
+try:
+    import zmq as _zmq
+    _ZMQ_OK = True
+except ImportError:
+    _ZMQ_OK = False
+
 # Reuse the physics EKF from the detection module
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from ball_detection import (
@@ -83,13 +89,21 @@ def main():
                     help="if >0, forward fused state to viz3d.py on this port")
     ap.add_argument("--webview-port", type=int, default=0,
                     help="if >0, forward fused state to webview.py on this port")
+    # Trajectory publisher for external subscribers (ZMQ PUB)
+    ap.add_argument("--traj-pub-port", type=int, default=0,
+                    help="if >0, publish trajectory on this ZMQ PUB port at 30 Hz "
+                         "(e.g. --traj-pub-port 5580; subscribers: tcp://<host>:5580)")
+    ap.add_argument("--traj-pub-hz",  type=float, default=30.0,
+                    help="trajectory publish rate in Hz (default 30)")
+    ap.add_argument("--traj-pub-sec", type=float, default=2.0,
+                    help="seconds ahead to predict in published trajectory (default 2.0)")
     args = ap.parse_args()
 
     ekf = PhysicsEKF(coeff_drag=args.coeff_drag)
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind((args.host, args.port))
-    sock.settimeout(0.05)   # 50 ms — wakes up to refresh terminal even when idle
+    sock.settimeout(0.010)  # 10 ms — allows 30 Hz timers to fire even when idle
     print(f"[fusion] listening on {args.host}:{args.port}  "
           f"drag={args.coeff_drag} rest=({args.rest_x},{args.rest_y},{args.rest_z})")
 
@@ -101,13 +115,30 @@ def main():
         fwd_web = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         print(f"[fusion] forward webview → 127.0.0.1:{args.webview_port}")
 
+    # ZMQ trajectory publisher
+    traj_pub = None
+    if args.traj_pub_port > 0:
+        if not _ZMQ_OK:
+            print("[fusion] WARNING: --traj-pub-port set but pyzmq not installed; "
+                  "run: pip install pyzmq", file=sys.stderr)
+        else:
+            _zmq_ctx = _zmq.Context.instance()
+            traj_pub = _zmq_ctx.socket(_zmq.PUB)
+            traj_pub.setsockopt(_zmq.SNDHWM, 2)   # drop old frames, never block
+            traj_pub.bind(f"tcp://*:{args.traj_pub_port}")
+            print(f"[fusion] traj ZMQ PUB → tcp://*:{args.traj_pub_port}  "
+                  f"{args.traj_pub_hz:.0f} Hz  {args.traj_pub_sec:.1f}s ahead")
+
     # Per-source rolling stats
     stats = {}     # cam_id → {"n_total", "t_first", "t_last", "last_pos", "last_depth", "last_tag"}
-    last_print_t  = 0.0
-    print_period  = 1.0 / max(args.print_hz, 1.0)
-    last_traj_t   = 0.0
-    last_cam_hb_t = 0.0   # cam-position heartbeat when EKF not yet initialized
-    cached_traj   = []   # cached EKF rollout for forwarding
+    last_print_t      = 0.0
+    print_period      = 1.0 / max(args.print_hz, 1.0)
+    last_traj_t       = 0.0
+    last_cam_hb_t     = 0.0   # cam-position heartbeat when EKF not yet initialized
+    last_pub_t        = 0.0   # ZMQ traj publisher timer
+    pub_period        = 1.0 / max(args.traj_pub_hz, 1.0)
+    last_accepted_t   = 0.0   # wall time of last accepted EKF measurement
+    cached_traj       = []   # cached EKF rollout for forwarding
 
     print("[fusion] waiting for packets…")
     try:
@@ -124,8 +155,10 @@ def main():
             now = time.time()
 
             if pkt is not None:
-                _consume(pkt, now, ekf, stats, args.max_age_ms,
-                         args.require_tag, args.max_tag_age)
+                accepted = _consume(pkt, now, ekf, stats, args.max_age_ms,
+                                    args.require_tag, args.max_tag_age)
+                if accepted:
+                    last_accepted_t = now
 
             # Throttled terminal status + viewer forwarding
             if now - last_print_t >= print_period:
@@ -137,6 +170,12 @@ def main():
                 cached_traj = ekf.rollout(cx=args.rest_x, cy=args.rest_y, cz=args.rest_z)
                 last_traj_t = now
                 _forward(cached_traj, ekf, stats, args, fwd_viz3d, fwd_web)
+
+            # ── ZMQ trajectory publisher (30 Hz) ──────────────────────────────
+            if traj_pub is not None and ekf.initialized and now - last_pub_t >= pub_period:
+                last_pub_t = now
+                _publish_traj(traj_pub, ekf, now, last_accepted_t,
+                              args.traj_pub_sec, args.rest_x, args.rest_y, args.rest_z)
 
             # Cam-position heartbeat (5 Hz) when EKF not yet initialized
             # Lets camera triangles appear in monitor.html before any ball is seen.
@@ -161,17 +200,18 @@ def main():
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _consume(pkt, now, ekf, stats, max_age_ms, require_tag, max_tag_age):
+    """Returns True if a measurement was accepted into the EKF, False otherwise."""
     try:
         t_pkt   = float(pkt["t"])
         cam_id  = str(pkt["cam_id"])
         tag_id  = int(pkt.get("tag_id", -1))
         tag_age = int(pkt.get("tag_age", 9999))
     except (KeyError, TypeError, ValueError):
-        return
+        return False
 
     age_ms = (now - t_pkt) * 1000.0
     if abs(age_ms) > max_age_ms:
-        return
+        return False
 
     s = stats.setdefault(cam_id, {
         "n_total": 0, "n_dropped": 0, "t_first": now, "t_last": now,
@@ -188,13 +228,13 @@ def _consume(pkt, now, ekf, stats, max_age_ms, require_tag, max_tag_age):
     # Cam-only heartbeat (no ball measurement) — update pose but skip EKF
     pos_raw = pkt.get("pos")
     if pos_raw is None:
-        return
+        return False
 
     try:
         pos = np.asarray(pos_raw, dtype=float)
         cov = max(float(pkt.get("cov", 0.05)), 1e-6)
     except (TypeError, ValueError):
-        return
+        return False
 
     # Per-source fps bookkeeping (only for ball packets, not heartbeats)
     if s["last_pos"] is not None:
@@ -207,10 +247,47 @@ def _consume(pkt, now, ekf, stats, max_age_ms, require_tag, max_tag_age):
 
     if require_tag and (tag_id < 0 or tag_age > max_tag_age):
         s["n_dropped"] += 1
-        return
+        return False
 
     R_meas = np.eye(3) * cov
     ekf.update(pos, R_meas, t_pkt)
+    return True
+
+
+def _publish_traj(pub_sock, ekf, now, last_accepted_t, t_ahead, cx, cy, cz):
+    """
+    Publish fused trajectory over ZMQ PUB.
+
+    Message format (JSON):
+      {
+        "stamp":    <float>  Unix time of this publish (seconds)
+        "t_obs":    <float>  Unix time of last accepted camera measurement
+        "detected": <bool>   True = fresh measurement ≤200 ms ago; False = EKF coasting
+        "pos":      [x,y,z]  current EKF position (m), world frame (AprilTag origin, Z-up)
+        "vel":      [vx,vy,vz]  current EKF velocity (m/s)
+        "traj":     [[x,y,z,t], ...]   predicted waypoints;
+                    t = seconds from 'stamp' when ball reaches that point
+      }
+
+    Coordinate frame:
+      Origin = AprilTag centre (0,0,0).  Z+ = up.  Units: metres, seconds.
+    """
+    traj_pts = ekf.rollout(t_ahead=t_ahead, cx=cx, cy=cy, cz=cz)
+    detected = (now - last_accepted_t) < 0.2   # fresh if observed within 200 ms
+    msg = {
+        "stamp":    round(now, 4),
+        "t_obs":    round(last_accepted_t, 4),
+        "detected": detected,
+        "pos":  [round(float(v), 4) for v in ekf.x[:3]],
+        "vel":  [round(float(v), 4) for v in ekf.x[3:]],
+        "traj": [[round(float(p[0]), 4), round(float(p[1]), 4),
+                  round(float(p[2]), 4), round(float(t),    4)]
+                 for t, p in traj_pts],
+    }
+    try:
+        pub_sock.send(json.dumps(msg).encode(), _zmq.NOBLOCK)
+    except Exception:
+        pass
 
 
 def _print_status(stats, ekf, now):
